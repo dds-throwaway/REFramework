@@ -5,12 +5,17 @@
 #include <shared_mutex>
 #include <iomanip>
 #include <regex>
+#include <atomic>
+#include <cstdint>
 #include <fstream>
 #include <immintrin.h>
+#include <sstream>
+#include <string_view>
 
 #include <asmjit/asmjit.h>
 #include <asmjit/x86/x86assembler.h>
 
+#include "utility/Exceptions.hpp"
 #include "utility/Module.hpp"
 #include "utility/Scan.hpp"
 #include "utility/Emulation.hpp"
@@ -31,6 +36,816 @@ struct IntegrityCheckPattern {
     std::string pat{};
     uint32_t offset{};
 };
+
+namespace {
+
+// The game's integrity protection trips via DebugBreak (STATUS_BREAKPOINT). Hooking it lets us log
+// the exact call site and callstack, which is the "injection path" the protection uses. This is
+// diagnostic: the original DebugBreak is still called so behaviour is unchanged.
+std::unique_ptr<FunctionHook> s_debug_break_hook{};
+std::atomic<bool> s_dumped_debug_break_callstack{false};
+
+void WINAPI debug_break_hook() {
+    spdlog::warn("[IntegrityCheckBypass]: DebugBreak called from 0x{:X}", (uintptr_t)_ReturnAddress());
+
+    if (!s_dumped_debug_break_callstack.exchange(true)) {
+        utility::exceptions::dump_callstack(nullptr);
+    }
+
+    if (s_debug_break_hook != nullptr) {
+        s_debug_break_hook->get_original<decltype(debug_break_hook)>()();
+    }
+}
+
+using RtlAddVectoredExceptionHandler_t = PVOID(NTAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+
+// First-chance logger. The unhandled exception filter never fires for this crash, so catch the
+// exception (access violation / inline int3 / illegal instruction) before anything can swallow it
+// and log the faulting RIP + callstack. Registered via ntdll directly so it bypasses REFramework's
+// own AddVectoredExceptionHandler filter.
+// Resolve a raw code address to the function entrypoint containing it. Uses the game's exception
+// directory (.pdata, RVA 0x202BA000) via kananlib. Addresses inside the obfuscated .udata region
+// have no unwind entries and will not resolve.
+static std::optional<uintptr_t> kananlib_function_entrypoint(uintptr_t addr) {
+    if (const auto entry = utility::find_function_start_unwind(addr)) {
+        return entry;
+    }
+
+    return utility::find_function_start(addr);
+}
+
+// True if the live bytes at `addr` differ from the on-disk module image, i.e. something patched it
+// at runtime. Returns the original (disk) bytes of the patched prefix.
+static std::vector<uint8_t> kananlib_patched_bytes(uintptr_t addr) {
+    if (const auto original = utility::get_original_bytes(addr)) {
+        return *original;
+    }
+
+    return {};
+}
+
+static std::string describe_address(uintptr_t addr) {
+    const auto module = utility::get_module_within(addr);
+    if (!module) {
+        return fmt::format("0x{:X} (no module)", addr);
+    }
+
+    std::string out = fmt::format("0x{:X} (module+0x{:X}", addr, addr - (uintptr_t)*module);
+
+    if (const auto entry = kananlib_function_entrypoint(addr)) {
+        out += fmt::format(", fn+0x{:X}", addr - *entry);
+    } else {
+        out += ", no fn entry";
+    }
+
+    return out + ")";
+}
+
+// Log every qword in [rsp, rsp + depth*8) that points into a module. Used on the faulting stack
+// (return addresses) and, at a hook site, on the game's own stack: a mid-hook's trampoline is where
+// RtlCaptureStackBackTrace stops, so the game frames below it are only visible by walking
+// context.rsp by hand.
+static void log_stack_scan(uintptr_t rsp, size_t depth, std::string_view tag) {
+    if (rsp == 0 || IsBadReadPtr((void*)rsp, depth * sizeof(uintptr_t))) {
+        return;
+    }
+
+    const auto stack = (const uintptr_t*)rsp;
+
+    for (size_t i = 0; i < depth; ++i) {
+        const auto value = stack[i];
+
+        if (value < 0x10000 || value > 0x7FFFFFFFFFFF) {
+            continue;
+        }
+
+        if (utility::get_module_within(value)) {
+            spdlog::error("[IntegrityCheckBypass]:     {} stack[{}] = {}", tag, i, describe_address(value));
+        }
+    }
+}
+
+// The fatal fault is a `ret` to a zeroed return slot, and RSP at the fault is byte-identical on
+// every run (0x1850C3E0), so the destroyed slot has a FIXED address. That makes the store that
+// destroys it catchable with a hardware data-write breakpoint instead of guessing at gadgets:
+// `mov qword [rsp],0` alone occurs 7348 times in this image (7344 of them in .udata), all part of
+// the obfuscator's stack-spoofing idiom, so pattern-matching the destroyer is a dead end.
+//
+// DR0..DR3 cover 8 bytes each, which spans the whole window visible in the fault frame:
+//   [rsp-32] = the ud2 decoy, [rsp-24]/[rsp-16] locals, [rsp-8] the wiped return slot.
+// A hit is a trap AFTER the store, so RIP is the instruction following it.
+// The frame sits at a fixed offset from the thread's stack base: RSP at the fault is
+// StackBase - 0x3C20 on every run (0x1850C3E0 with StackBase 0x18510000, 0x19BDC3E0 with StackBase
+// 0x19BE0000). An absolute address is therefore wrong the moment anything shifts the layout -- which
+// is exactly what happened once the early phase started creating threads, and it silently cost a run.
+// Derive the window per thread instead.
+static constexpr uintptr_t STACK_WATCH_FROM_BASE = 0x3C40; // ..-0x20, i.e. [R0-24, R0]
+static constexpr size_t STACK_WATCH_SIZE = 0x20;
+static constexpr uintptr_t STACK_WATCH_DR7 = 0x99990055; // 4x local-enable, RW=write, LEN=8 bytes
+static constexpr uint32_t STACK_WATCH_MAX_HITS = 128;
+
+// Minimal THREAD_BASIC_INFORMATION (ThreadBasicInformation == 0); winternl.h is not pulled in here.
+struct ThreadBasicInfo {
+    NTSTATUS exit_status;
+    void* teb;
+    uintptr_t unique_process;
+    uintptr_t unique_thread;
+    uintptr_t affinity_mask;
+    int32_t priority;
+    int32_t base_priority;
+};
+
+// NT_TIB.StackBase lives at +8 in the TEB.
+static uintptr_t stack_base_of(void* teb) {
+    return teb != nullptr ? *(const uintptr_t*)((uintptr_t)teb + 8) : 0;
+}
+
+static uintptr_t stack_watch_base_of(void* teb) {
+    const auto base = stack_base_of(teb);
+
+    return base > STACK_WATCH_FROM_BASE ? base - STACK_WATCH_FROM_BASE : 0;
+}
+
+static uintptr_t stack_watch_base_here() {
+    return stack_watch_base_of(NtCurrentTeb());
+}
+
+static std::atomic<uint32_t> s_stack_watch_hits{0};
+static std::atomic<bool> s_stack_watch_disarmed{false};
+static std::vector<std::unique_ptr<Patch>> s_stack_watch_patches{};
+
+// Wine backs hardware breakpoints with ptrace, which only exists while the thread is being traced by
+// something. A silent "0 hits" is therefore ambiguous -- no write happened, or the debug registers
+// were never programmed -- so prove the mechanism on the calling thread before trusting a negative.
+static volatile uint64_t s_dr_selftest_slot[2]{};
+static std::atomic<bool> s_dr_selftest_active{false};
+static std::atomic<bool> s_dr_selftest_hit{false};
+static constexpr uintptr_t DR_SELFTEST_DR7 = 0x00090001; // L0, R/W0=write, LEN0=8 bytes
+
+// Nothing logged before REFramework's constructor runs reaches the log file -- the file sink is
+// installed there (REFramework.cpp:259/270), which is why `[Thread] startup_thread TID` never shows
+// up. The early-phase work below has to run before that point, so buffer its output and flush it
+// once the sink exists.
+static std::atomic<bool> s_early_phase{true};
+static std::vector<std::string> s_deferred_early_log{};
+
+// A raw, flushed, always-on early log. The main log file is only created by the REFramework
+// constructor, so anything that kills the process during the early phase leaves no log at all -- which
+// has now happened twice. This writes with Win32 directly (no CRT, no heap) and flushes per line.
+static HANDLE s_early_log_file = INVALID_HANDLE_VALUE;
+
+static void early_log_raw(const std::string& line) {
+    if (s_early_log_file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    const auto text = line + "\r\n";
+    DWORD written = 0;
+
+    WriteFile(s_early_log_file, text.data(), (DWORD)text.size(), &written, nullptr);
+    FlushFileBuffers(s_early_log_file);
+}
+
+static void early_log_open() {
+    if (s_early_log_file != INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    wchar_t module_path[MAX_PATH]{};
+
+    if (GetModuleFileNameW(nullptr, module_path, MAX_PATH) == 0) {
+        return;
+    }
+
+    std::wstring path{module_path};
+    const auto slash = path.find_last_of(L"\\/");
+
+    if (slash == std::wstring::npos) {
+        return;
+    }
+
+    path = path.substr(0, slash + 1) + L"reframework_early_log.txt";
+
+    s_early_log_file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+static void diag_log(std::string message) {
+    early_log_raw(message);
+
+    if (s_early_phase.load(std::memory_order_relaxed)) {
+        if (s_deferred_early_log.size() < 1024) {
+            s_deferred_early_log.push_back(std::move(message));
+        }
+
+        return;
+    }
+
+    spdlog::error("[IntegrityCheckBypass]: {}", message);
+}
+
+static void flush_early_log() {
+    s_early_phase = false;
+
+    for (const auto& message : s_deferred_early_log) {
+        spdlog::error("[IntegrityCheckBypass]: (early) {}", message);
+    }
+
+    spdlog::info("[IntegrityCheckBypass]: flushed {} buffered early diagnostic line(s).", s_deferred_early_log.size());
+    s_deferred_early_log.clear();
+}
+
+// A data-breakpoint trap is EXCEPTION_SINGLE_STEP. Without the vectored handler installed it is an
+// unhandled exception and kills the process on the spot -- which is exactly what the DR self-test
+// did when it ran before the handler existed. Nothing may raise a trap before this is true.
+static std::atomic<bool> s_first_chance_logger_installed{false};
+
+// Debug registers are per-thread, so a thread created after arming is not covered. Track what has
+// been armed and re-arm only the newcomers, so a background loop is cheap.
+static std::unordered_set<DWORD> s_armed_tids{};
+static std::mutex s_armed_tids_mutex{};
+
+static void run_dr_selftest() {
+    if (!s_first_chance_logger_installed.load(std::memory_order_relaxed)) {
+        diag_log("DR self-test skipped: the vectored handler is not installed, so a single-step trap would be fatal");
+        return;
+    }
+
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+    if (!GetThreadContext(GetCurrentThread(), &ctx)) {
+        diag_log("DR self-test: GetThreadContext failed");
+        return;
+    }
+
+    ctx.Dr0 = (uintptr_t)&s_dr_selftest_slot[0];
+    ctx.Dr1 = ctx.Dr2 = ctx.Dr3 = 0;
+    ctx.Dr7 = DR_SELFTEST_DR7;
+
+    if (!SetThreadContext(GetCurrentThread(), &ctx)) {
+        diag_log("DR self-test: SetThreadContext failed");
+        return;
+    }
+
+    s_dr_selftest_active = true;
+    s_dr_selftest_hit = false;
+    s_dr_selftest_slot[0] = 0x1122334455667788ULL;
+    s_dr_selftest_active = false;
+
+    const auto hit = s_dr_selftest_hit.load();
+
+    ctx.Dr0 = 0;
+    ctx.Dr7 = 0;
+    SetThreadContext(GetCurrentThread(), &ctx);
+
+    if (hit) {
+        diag_log("DR self-test OK -- hardware write watchpoints are live");
+    } else {
+        diag_log("DR self-test FAILED -- the OS/Wine did not program the debug registers, so a negative"
+                 " stack-watch result proves nothing. Use an external debugger: winedbg --gdb +"
+                 " `watch *(long long*)0x1850C3D8`");
+    }
+}
+
+// Arm a write watchpoint on every other thread in the process. Called while REFramework's
+// ThreadSuspender already has them frozen, so the +1/-1 suspend count here is a no-op on them.
+static void arm_stack_write_watchpoints(bool report = true) {
+    using NtQueryInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
+    static const auto nt_query_information_thread =
+        (NtQueryInformationThread_t)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
+
+    if (nt_query_information_thread == nullptr) {
+        diag_log("could not resolve NtQueryInformationThread");
+        return;
+    }
+
+    const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        diag_log("could not snapshot threads to arm stack watchpoints");
+        return;
+    }
+
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+
+    const auto pid = GetCurrentProcessId();
+    const auto self = GetCurrentThreadId();
+    uint32_t armed = 0;
+
+    for (auto ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) {
+            continue;
+        }
+
+        {
+            std::scoped_lock _{s_armed_tids_mutex};
+
+            if (!s_armed_tids.emplace(entry.th32ThreadID).second) {
+                continue;
+            }
+        }
+
+        const auto thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID);
+
+        if (thread == nullptr) {
+            continue;
+        }
+
+        if (SuspendThread(thread) == (DWORD)-1) {
+            CloseHandle(thread);
+            continue;
+        }
+
+        // Per-thread window, derived from this thread's own stack base.
+        ThreadBasicInfo info{};
+
+        if (nt_query_information_thread(thread, 0 /*ThreadBasicInformation*/, &info, sizeof(info), nullptr) < 0) {
+            ResumeThread(thread);
+            CloseHandle(thread);
+            continue;
+        }
+
+        const auto watch = stack_watch_base_of(info.teb);
+        const auto stack_base = stack_base_of(info.teb);
+
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+        uintptr_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+        auto sampled = false;
+
+        if (watch != 0 && GetThreadContext(thread, &ctx)) {
+            ctx.Dr0 = watch;
+            ctx.Dr1 = watch + 8;
+            ctx.Dr2 = watch + 16;
+            ctx.Dr3 = watch + 24;
+            ctx.Dr7 = STACK_WATCH_DR7;
+
+            if (SetThreadContext(thread, &ctx)) {
+                ++armed;
+
+                const auto window = (const uintptr_t*)watch;
+
+                if (!IsBadReadPtr((void*)watch, STACK_WATCH_SIZE)) {
+                    w0 = window[0];
+                    w1 = window[1];
+                    w2 = window[2];
+                    w3 = window[3];
+                    sampled = true;
+                }
+            }
+        }
+
+        ResumeThread(thread);
+        CloseHandle(thread);
+
+        // Log OUTSIDE the suspend/resume region: allocating (fmt, std::string, the deferred buffer)
+        // while another thread is frozen can deadlock on a heap lock it is holding.
+        if (sampled) {
+            diag_log(fmt::format("  TID {} StackBase 0x{:X} window {:016X} {:016X} {:016X} {:016X}", entry.th32ThreadID, stack_base,
+                w0, w1, w2, w3));
+        }
+    }
+
+    CloseHandle(snapshot);
+
+    if (!report) {
+        return;
+    }
+
+    diag_log(fmt::format("armed stack write watchpoints on {} new thread(s); window = StackBase-0x{:X}..-0x{:X}", armed,
+        STACK_WATCH_FROM_BASE, STACK_WATCH_FROM_BASE - STACK_WATCH_SIZE));
+
+    // This thread's own window, so there is always a sample of what the frame looks like at arm time
+    // even if the crashing thread did not exist yet.
+    const auto own_watch = stack_watch_base_here();
+
+    if (own_watch != 0 && !IsBadReadPtr((void*)own_watch, STACK_WATCH_SIZE)) {
+        const auto window = (const uintptr_t*)own_watch;
+
+        diag_log(fmt::format("own window at arm time (StackBase 0x{:X}): {:016X} {:016X} {:016X} {:016X}", stack_base_of(NtCurrentTeb()),
+            window[0], window[1], window[2], window[3]));
+    }
+
+    // This thread is the one doing the arming, so it is not in the loop above; test on it.
+    run_dr_selftest();
+}
+
+static void log_stack_watch_hit(EXCEPTION_POINTERS* ei) {
+    const auto& ctx = *ei->ContextRecord;
+    const auto rip = (uintptr_t)ctx.Rip;
+    const auto hit = s_stack_watch_hits.fetch_add(1, std::memory_order_relaxed);
+    const auto watch = stack_watch_base_here();
+    const auto watched = (const uintptr_t*)watch;
+
+    if (hit < STACK_WATCH_MAX_HITS) {
+        std::string behind{};
+
+        if (rip >= 16 && !IsBadReadPtr((void*)(rip - 16), 16)) {
+            const auto bytes = (const uint8_t*)(rip - 16);
+
+            for (size_t i = 0; i < 16; ++i) {
+                behind += fmt::format("{:02X} ", bytes[i]);
+            }
+        }
+
+        uintptr_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+
+        if (watch != 0 && !IsBadReadPtr((void*)watch, STACK_WATCH_SIZE)) {
+            w0 = watched[0];
+            w1 = watched[1];
+            w2 = watched[2];
+            w3 = watched[3];
+        }
+
+        diag_log(fmt::format("stack watch hit #{}: writer RIP 0x{:X} ({}) bytes before: {} | window: {:016X} {:016X} {:016X} {:016X}",
+            hit, rip, describe_address(rip), behind, w0, w1, w2, w3));
+        // The destroyer's primitive. NOP it in place: the gadget keeps its control flow, the return
+        // slot survives, and if this is the real culprit the crash goes away on the next ret.
+        static constexpr uint8_t mov_rsp_zero[] = {0x48, 0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00};
+
+        if (rip >= sizeof(mov_rsp_zero) && !IsBadReadPtr((void*)(rip - sizeof(mov_rsp_zero)), sizeof(mov_rsp_zero)) &&
+            memcmp((const void*)(rip - sizeof(mov_rsp_zero)), mov_rsp_zero, sizeof(mov_rsp_zero)) == 0) {
+            s_stack_watch_patches.emplace_back(
+                Patch::create(rip - sizeof(mov_rsp_zero), {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90}, true));
+
+            diag_log(fmt::format("NOP'd `mov qword [rsp],0` at 0x{:X} -- return slot preserved", rip - sizeof(mov_rsp_zero)));
+        }
+    }
+
+    // Every write in the window traps. Bail out before that turns into a stall if it is a hot path.
+    if (hit + 1 >= STACK_WATCH_MAX_HITS && !s_stack_watch_disarmed.exchange(true)) {
+        ei->ContextRecord->Dr0 = 0;
+        ei->ContextRecord->Dr1 = 0;
+        ei->ContextRecord->Dr2 = 0;
+        ei->ContextRecord->Dr3 = 0;
+        ei->ContextRecord->Dr7 = 0;
+
+        diag_log(fmt::format("stack watchpoints disarmed after {} hits", STACK_WATCH_MAX_HITS));
+    }
+}
+
+LONG CALLBACK first_chance_exception_logger(EXCEPTION_POINTERS* ei) {
+    if (ei == nullptr || ei->ExceptionRecord == nullptr || ei->ContextRecord == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    const auto code = ei->ExceptionRecord->ExceptionCode;
+
+    // Data breakpoint from arm_stack_write_watchpoints(). Traps after the store, so RIP is already
+    // past the writer.
+    if (code == EXCEPTION_SINGLE_STEP) {
+        // Self-test: our own store to a known slot.
+        if (s_dr_selftest_active.load() && ei->ContextRecord->Dr7 == DR_SELFTEST_DR7) {
+            s_dr_selftest_hit = true;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // Only ours: Wine/the game can raise single-step for other reasons (TF, internal stepping).
+        if (ei->ContextRecord->Dr7 == STACK_WATCH_DR7) {
+            log_stack_watch_hit(ei);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_BREAKPOINT && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_IN_PAGE_ERROR && code != 0xC0000409 /*STATUS_STACK_BUFFER_OVERRUN*/) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    const auto rip = (uintptr_t)ei->ContextRecord->Rip;
+
+    // Dedupe by faulting RIP instead of a hard cap: REFramework's own speculative memory probing
+    // fires the same few AVs over and over and previously burned the 32-entry budget before the
+    // real crash. Each unique RIP is logged once.
+    constexpr size_t max_unique_rips = 128;
+    static std::atomic<uintptr_t> s_seen_rips[max_unique_rips];
+    static std::atomic<size_t> s_seen_rip_count{0};
+
+    const auto seen_count = s_seen_rip_count.load(std::memory_order_relaxed);
+
+    // Never drop the fatal case. The handler is now installed during the early phase and sees a lot
+    // more traffic before the crash, so the dedup budget could otherwise be spent by then.
+    if (rip != 0) {
+        for (size_t i = 0; i < seen_count && i < max_unique_rips; ++i) {
+            if (s_seen_rips[i].load(std::memory_order_relaxed) == rip) {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+        }
+
+        if (seen_count >= max_unique_rips) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        s_seen_rips[seen_count].store(rip, std::memory_order_relaxed);
+        s_seen_rip_count.store(seen_count + 1, std::memory_order_relaxed);
+    }
+
+    spdlog::error("[IntegrityCheckBypass]: First-chance exception 0x{:X} at 0x{:X}, RIP 0x{:X}, RSP 0x{:X}", code,
+        (uintptr_t)ei->ExceptionRecord->ExceptionAddress, rip, (uintptr_t)ei->ContextRecord->Rsp);
+
+    if (code == EXCEPTION_ACCESS_VIOLATION && ei->ExceptionRecord->NumberParameters >= 2) {
+        const auto av_type = ei->ExceptionRecord->ExceptionInformation[0]; // 0=read 1=write 8=execute
+        const auto av_addr = (uintptr_t)ei->ExceptionRecord->ExceptionInformation[1];
+
+        spdlog::error("[IntegrityCheckBypass]:     AV {} target 0x{:X}",
+            av_type == 0 ? "read" : (av_type == 1 ? "write" : (av_type == 8 ? "execute" : "?")), av_addr);
+    }
+
+    // For a jump/call through a NULL pointer the registers are the interesting part: the target
+    // (RAX/reg) is 0 and RCX/RDX/R8/R9 hold the call arguments (usually `this` + args).
+    if (rip == 0) {
+        const auto& ctx = *ei->ContextRecord;
+
+        spdlog::error("[IntegrityCheckBypass]:     regs: RAX 0x{:X} RBX 0x{:X} RCX 0x{:X} RDX 0x{:X} RSI 0x{:X} RDI 0x{:X} R8 0x{:X} R9 "
+                      "0x{:X} RBP 0x{:X}",
+            ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi, ctx.R8, ctx.R9, ctx.Rbp);
+
+        // A `ret` to 0 leaves the destroyed slot just below RSP; a `call` through 0 leaves the
+        // caller's return address at [RSP]. This tells the two apart.
+        const auto fault_rsp = (uintptr_t)ctx.Rsp;
+
+        if (fault_rsp >= 0x20 && !IsBadReadPtr((void*)(fault_rsp - 0x20), 0x28)) {
+            const auto below = (const uintptr_t*)(fault_rsp - 0x20);
+
+            spdlog::error("[IntegrityCheckBypass]:     below RSP: [rsp-8] 0x{:X} [rsp-16] 0x{:X} [rsp-24] 0x{:X} [rsp-32] 0x{:X}",
+                below[3], below[2], below[1], below[0]);
+        }
+
+        // The watched window at fault time, to compare against `window at arm time`.
+        const auto watch = stack_watch_base_here();
+
+        if (watch != 0 && !IsBadReadPtr((void*)watch, STACK_WATCH_SIZE)) {
+            const auto window = (const uintptr_t*)watch;
+
+            spdlog::error("[IntegrityCheckBypass]:     window at fault: {:016X} {:016X} {:016X} {:016X}", window[0], window[1],
+                window[2], window[3]);
+        }
+
+        // Everything the VM left in registers plus a raw stack window. The stack is destroyed and
+        // the registers are the only other state, so capture both verbatim -- there is no second
+        // chance to look at this process.
+        spdlog::error("[IntegrityCheckBypass]:     regs2: R10 0x{:X} R11 0x{:X} R12 0x{:X} R13 0x{:X} R14 0x{:X} R15 0x{:X} RSP 0x{:X} RIP 0x{:X} EFLAGS 0x{:X}",
+            ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15, ctx.Rsp, ctx.Rip, ctx.EFlags);
+
+        if (fault_rsp != 0 && !IsBadReadPtr((void*)fault_rsp, 0x60 * sizeof(uintptr_t))) {
+            const auto stack = (const uintptr_t*)fault_rsp;
+
+            for (size_t row = 0; row < 0x60; row += 4) {
+                spdlog::error("[IntegrityCheckBypass]:     raw stack[{:3}..{:3}] {:016X} {:016X} {:016X} {:016X}", row, row + 3,
+                    stack[row], stack[row + 1], stack[row + 2], stack[row + 3]);
+            }
+        }
+    }
+
+    // Identify the faulting thread. ThreadSuspender freezes *every* thread in the process (including
+    // REFramework's own workers), so knowing whether the crash is on a dinput8-owned thread or a
+    // game-created one changes the diagnosis entirely. The thread's start address resolves that:
+    // start inside the REFramework module => REFramework thread, otherwise the game owns it.
+    {
+        const auto tid = GetCurrentThreadId();
+        uintptr_t thread_start = 0;
+
+        // ThreadQuerySetWin32StartAddress == 9. Resolved dynamically to avoid winternl.h dependencies.
+        using NtQueryInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
+        static const auto nt_query_information_thread =
+            (NtQueryInformationThread_t)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
+
+        if (const auto thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid)) {
+            if (nt_query_information_thread != nullptr) {
+                nt_query_information_thread(thread, 9, &thread_start, sizeof(thread_start), nullptr);
+            }
+            CloseHandle(thread);
+        }
+
+        const auto self = utility::get_module_within((uintptr_t)&first_chance_exception_logger);
+
+        if (thread_start == 0) {
+            spdlog::error("[IntegrityCheckBypass]:     thread TID {} has no Win32 start address (CRT/game-created); ownership unknown", tid);
+        } else if (const auto module = utility::get_module_within(thread_start)) {
+            const auto owner = (self && *module == *self) ? " <-- REFramework thread" : " <-- game thread";
+
+            spdlog::error("[IntegrityCheckBypass]:     thread TID {} started at {}{}", tid, describe_address(thread_start), owner);
+
+            if (const auto patched = kananlib_patched_bytes(thread_start); !patched.empty()) {
+                std::string bytes{};
+                for (const auto b : patched) {
+                    bytes += fmt::format("{:02X} ", b);
+                }
+
+                spdlog::error("[IntegrityCheckBypass]:     thread entry patched at runtime: {} ({} bytes)", bytes, patched.size());
+            }
+        } else {
+            spdlog::error("[IntegrityCheckBypass]:     thread TID {} started at 0x{:X}{}", tid, thread_start,
+                (thread_start == 0) ? " (unknown / started via std::thread)" : "");
+        }
+    }
+
+    // The faulting call's return address lives on the stack when RIP itself is garbage/0 (a call
+    // through a NULL function pointer). dump_callstack() cannot see it because it is not part of the
+    // faulting frame chain.
+    const auto rsp = (uintptr_t)ei->ContextRecord->Rsp;
+
+    if (rsp != 0 && !IsBadReadPtr((void*)rsp, 0x100 * sizeof(uintptr_t))) {
+        const auto stack = (const uintptr_t*)rsp;
+
+        spdlog::error("[IntegrityCheckBypass]:     stack: 0x{:X} 0x{:X} 0x{:X} 0x{:X} 0x{:X} 0x{:X} 0x{:X} 0x{:X}", stack[0], stack[1],
+            stack[2], stack[3], stack[4], stack[5], stack[6], stack[7]);
+
+        // Resolve every slot that lands inside a module; the return address of the faulty call is
+        // deeper than the first 8 qwords when the frame has locals/a stack cookie in front of it.
+        for (size_t i = 0; i < 0x100; ++i) {
+            const auto value = stack[i];
+
+            if (value < 0x10000 || value > 0x7FFFFFFFFFFF) {
+                continue;
+            }
+
+            if (utility::get_module_within(value)) {
+                spdlog::error("[IntegrityCheckBypass]:     stack[{}] = {}", i, describe_address(value));
+            }
+        }
+    }
+
+    // The hook trampoline's own frames are all dump_callstack() can see, so it is pure noise here.
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void init_first_chance_exception_logger() {
+    static bool s_initialized = false;
+
+    if (s_initialized) {
+        return;
+    }
+
+    s_initialized = true;
+
+    const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+    const auto rtl_add_veh =
+        ntdll != nullptr ? (RtlAddVectoredExceptionHandler_t)GetProcAddress(ntdll, "RtlAddVectoredExceptionHandler") : nullptr;
+
+    if (rtl_add_veh == nullptr) {
+        spdlog::error("[IntegrityCheckBypass]: Could not resolve RtlAddVectoredExceptionHandler!");
+        return;
+    }
+
+    if (rtl_add_veh(1, &first_chance_exception_logger) == nullptr) {
+        spdlog::error("[IntegrityCheckBypass]: Failed to install first-chance exception logger!");
+        return;
+    }
+
+    spdlog::info("[IntegrityCheckBypass]: Installed first-chance exception logger.");
+    s_first_chance_logger_installed = true;
+}
+
+using NtTerminateProcess_t = NTSTATUS(NTAPI*)(HANDLE, NTSTATUS);
+
+std::unique_ptr<FunctionHook> s_nt_terminate_process_hook{};
+
+// The silent deaths do not go through kernelbase!TerminateProcess or RtlExitUserProcess. Hook the
+// lowest-level ntdll wrapper so a direct ntdll call is still visible. Only dump a callstack when
+// the game itself asked for termination.
+NTSTATUS NTAPI nt_terminate_process_hook(HANDLE process, NTSTATUS exit_status) {
+    const auto retaddr = (uintptr_t)_ReturnAddress();
+    const auto caller = utility::get_module_within(retaddr);
+
+    if (caller && *caller == utility::get_executable()) {
+        spdlog::error(
+            "[IntegrityCheckBypass]: NtTerminateProcess(0x{:X}, 0x{:X}) from 0x{:X}", (uintptr_t)process, (uint32_t)exit_status, retaddr);
+
+        utility::exceptions::dump_callstack(nullptr);
+    }
+
+    if (s_nt_terminate_process_hook != nullptr) {
+        return s_nt_terminate_process_hook->get_original<decltype(nt_terminate_process_hook)>()(process, exit_status);
+    }
+
+    return 0;
+}
+
+void init_terminate_process_watcher() {
+    if (s_nt_terminate_process_hook != nullptr) {
+        return;
+    }
+
+    const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+    const auto nt_terminate = ntdll != nullptr ? GetProcAddress(ntdll, "NtTerminateProcess") : nullptr;
+
+    if (nt_terminate == nullptr) {
+        spdlog::error("[IntegrityCheckBypass]: Could not find NtTerminateProcess to hook!");
+        return;
+    }
+
+    s_nt_terminate_process_hook = std::make_unique<FunctionHook>((uintptr_t)nt_terminate, (uintptr_t)&nt_terminate_process_hook);
+
+    if (!s_nt_terminate_process_hook->create()) {
+        spdlog::error("[IntegrityCheckBypass]: Failed to hook NtTerminateProcess!");
+        s_nt_terminate_process_hook.reset();
+        return;
+    }
+
+    spdlog::info("[IntegrityCheckBypass]: Hooked NtTerminateProcess for diagnostics.");
+}
+
+std::unique_ptr<FunctionHook> s_report_gsfailure_hook{};
+std::unique_ptr<FunctionHook> s_self_report_gsfailure_hook{};
+
+static void log_gsfailure(std::string_view who) {
+    const auto ret_slot = (uintptr_t*)_AddressOfReturnAddress();
+
+    spdlog::error("[IntegrityCheckBypass]: __report_gsfailure ({})! retaddr 0x{:X}", who, (uintptr_t)_ReturnAddress());
+    spdlog::error("[IntegrityCheckBypass]: stack: 0x{:X} 0x{:X} 0x{:X} 0x{:X}", ret_slot[0], ret_slot[1], ret_slot[2], ret_slot[3]);
+
+    utility::exceptions::dump_callstack(nullptr);
+}
+
+// The silent deaths are __fastfail (int 0x29): __security_check_cookie (0x14B1295F0) jmps to
+// __report_gsfailure (0x14B15028C) on a stack cookie mismatch, which does int 0x29. That is the
+// game's stack-destroyer response and is uncatchable by VEH/termination hooks. Hook both the game's
+// and REFramework's own __report_gsfailure so the corrupted function and its callers are logged
+// before the process dies.
+void report_gsfailure_hook(uintptr_t cookie) {
+    log_gsfailure("game");
+
+    if (s_report_gsfailure_hook != nullptr) {
+        s_report_gsfailure_hook->get_original<decltype(report_gsfailure_hook)>()(cookie);
+    }
+}
+
+void self_report_gsfailure_hook(uintptr_t cookie) {
+    log_gsfailure("reframework");
+
+    if (s_self_report_gsfailure_hook != nullptr) {
+        s_self_report_gsfailure_hook->get_original<decltype(self_report_gsfailure_hook)>()(cookie);
+    }
+}
+
+static constexpr auto GSAFAILURE_SIG = "48 89 4C 24 08 48 83 EC 38 B9 17 00 00 00 FF 15";
+
+void init_gsfailure_watcher(HMODULE game) {
+    if (s_report_gsfailure_hook == nullptr) {
+        if (const auto gsfailure = utility::scan(game, GSAFAILURE_SIG)) {
+            s_report_gsfailure_hook = std::make_unique<FunctionHook>(*gsfailure, (uintptr_t)&report_gsfailure_hook);
+
+            if (!s_report_gsfailure_hook->create()) {
+                spdlog::error("[IntegrityCheckBypass]: Failed to hook game __report_gsfailure!");
+                s_report_gsfailure_hook.reset();
+            } else {
+                spdlog::info("[IntegrityCheckBypass]: Hooked game __report_gsfailure.");
+            }
+        } else {
+            spdlog::error("[IntegrityCheckBypass]: Could not find game __report_gsfailure!");
+        }
+    }
+
+    if (s_self_report_gsfailure_hook == nullptr) {
+        const auto self = utility::get_module_within((uintptr_t)&init_gsfailure_watcher);
+
+        if (self && *self != game) {
+            if (const auto gsfailure = utility::scan(*self, GSAFAILURE_SIG)) {
+                s_self_report_gsfailure_hook = std::make_unique<FunctionHook>(*gsfailure, (uintptr_t)&self_report_gsfailure_hook);
+
+                if (!s_self_report_gsfailure_hook->create()) {
+                    spdlog::error("[IntegrityCheckBypass]: Failed to hook reframework __report_gsfailure!");
+                    s_self_report_gsfailure_hook.reset();
+                } else {
+                    spdlog::info("[IntegrityCheckBypass]: Hooked reframework __report_gsfailure.");
+                }
+            } else {
+                spdlog::error("[IntegrityCheckBypass]: Could not find reframework __report_gsfailure!");
+            }
+        }
+    }
+}
+
+void init_debug_break_watcher() {
+    if (s_debug_break_hook != nullptr) {
+        return;
+    }
+
+    const auto kernelbase = GetModuleHandleW(L"kernelbase.dll");
+    const auto debug_break = kernelbase != nullptr ? GetProcAddress(kernelbase, "DebugBreak") : nullptr;
+
+    if (debug_break == nullptr) {
+        spdlog::error("[IntegrityCheckBypass]: Could not find DebugBreak to hook!");
+        return;
+    }
+
+    s_debug_break_hook = std::make_unique<FunctionHook>((uintptr_t)debug_break, (uintptr_t)&debug_break_hook);
+
+    if (!s_debug_break_hook->create()) {
+        spdlog::error("[IntegrityCheckBypass]: Failed to hook DebugBreak!");
+        s_debug_break_hook.reset();
+        return;
+    }
+
+    spdlog::info("[IntegrityCheckBypass]: Hooked DebugBreak for anti-tamper callstack logging.");
+}
+
+} // anonymous namespace
 
 std::shared_ptr<IntegrityCheckBypass> s_integrity_check_bypass_instance{nullptr};
 
@@ -670,6 +1485,7 @@ void IntegrityCheckBypass::init_anti_debug_watcher() {
     anti_debug_watcher();
 
     s_anti_anti_debug_thread = std::make_unique<std::jthread>([](std::stop_token stop_token) {
+        spdlog::info("[Thread] anti_debug_watcher TID {}", GetCurrentThreadId());
         spdlog::info("[IntegrityCheckBypass]: Hello from anti_debug_watcher!");
         spdlog::info("[IntegrityCheckBypass]: Waiting for REFramework startup to finish...");
 
@@ -1318,6 +2134,22 @@ void IntegrityCheckBypass::immediate_patch_dd2() {
     // TODO: Check if full release of Pragmata needs this
     // right now it freezes the game
     if (gi.is_mhwilds()) {
+            init_debug_break_watcher();
+            init_first_chance_exception_logger();
+            // MHWilds runs .\CrashReport.exe via ShellExecuteExW and calls ExitProcess(0)
+            // (MonsterHunterWilds.exe+0xA4D6E49) unless the child exits with code 0xCD. Do NOT fail
+            // ShellExecuteExW: that path sets edi=1 and makes the caller treat the check as failed.
+            // Instead force the PathFileExistsW branch to fall through to the "file does not exist"
+            // continue path, which returns 0.
+            if (const auto crash_report_launch = utility::scan(game, "48 8D 3D ? ? ? ? 48 89 F9 FF 15 ? ? ? ? 85 C0 75 ?")) {
+                static auto crash_report_patch = Patch::create(*crash_report_launch + 18, {0x90, 0x90}, true);
+                spdlog::info("[IntegrityCheckBypass]: Patched MHWilds CrashReport.exe check (site 1)!");
+            } else {
+                spdlog::error("[IntegrityCheckBypass]: Could not find MHWilds CrashReport.exe check (site 1)!");
+            }
+
+            init_terminate_process_watcher();
+            init_gsfailure_watcher(game);
     const auto query_performance_frequency = &QueryPerformanceFrequency;
     const auto query_performance_counter = &QueryPerformanceCounter;
 
@@ -1465,6 +2297,8 @@ void IntegrityCheckBypass::immediate_patch_dd2() {
                 } else {
                     spdlog::error("[IntegrityCheckBypass]: Could not find conditional_jmp for DD2.");
                 }
+            } else {
+                spdlog::error("[IntegrityCheckBypass]: Could not find and_eax_07 instruction for DD2 fallback.");
             }
         } else {
             spdlog::error("[IntegrityCheckBypass]: Could not find createBLAS!");
@@ -2277,21 +3111,550 @@ void IntegrityCheckBypass::re9_heartbeat_bypass() {
 
 }
 
-void IntegrityCheckBypass::remove_stack_destroyer() {
-    spdlog::info("[IntegrityCheckBypass]: Searching for stack destroyer...");
+// The new-style stack destroyer is a multi-instruction obfuscated gadget. The pattern scan above
+// points at the middle of that gadget, and patching there with RET would pop whatever the gadget
+// already pushed (not a return address). Resolve the gadget's entry point instead.
+//
+// These builds have no PE unwind info (no .pdata), so find_function_start/get_disassembly_behind
+// cannot be used. The obfuscator chains gadgets with RET (it pushes the next gadget address), so
+// the entry is the byte after the nearest preceding RET that decodes forward into the candidate.
+static std::optional<uintptr_t> find_stack_destroyer_entry(uintptr_t candidate, uintptr_t module_base) {
+    constexpr uintptr_t max_back = 0x200;
 
-    const auto game = utility::get_executable();
-    const auto fn = utility::scan(game, "48 89 11 48 c7 04 24 00 00 00 00 48 81 c4 28 01 00 00");
+    const auto limit = candidate > max_back ? candidate - max_back : module_base;
 
-    if (!fn) {
-        spdlog::error("[IntegrityCheckBypass]: Could not find stack destroyer!");
+    for (auto addr = candidate; addr > limit; --addr) {
+        if (*(uint8_t*)(addr - 1) != 0xC3) {
+            continue;
+        }
+
+        bool reached_candidate = false;
+
+        utility::linear_decode((uint8_t*)addr, (candidate - addr) + 0x20, [&](utility::ExhaustionContext& ctx) -> bool {
+            if (ctx.addr == candidate) {
+                reached_candidate = true;
+                return false;
+            }
+
+            return ctx.addr < candidate;
+        });
+
+        if (reached_candidate) {
+            return addr;
+        }
+    }
+
+    return std::nullopt;
+}
+
+// 1.42.0.2 carries a *second* stack destroyer that the .udata pivot above never matches. It is a
+// tail-call trampoline in .data:
+//
+//   mov     rax, rcx            ; 48 89 C8
+//   mov     qword ptr [rsp], 0  ; 48 C7 04 24 00 00 00 00   <- zeroes the return slot
+//   mov     ecx, 0              ; variant A ... or: mov rcx, rdx / mov edx, 0 ... variant B
+//   jmp     rax                 ; FF E0
+//
+// RCX is the real callee. This is the gadget on the faulting stack -- the ud2 at 0xAE46DDF sits
+// immediately after its `jmp rax` -- and the crash context matches variant B exactly: RAX = old RCX
+// (0), RCX = old RDX (0x3F32D2192AE10000), RDX = 0. So the caller computed a NULL callee and
+// `jmp rax` faulted at RIP=0.
+//
+// Diagnostic only: patching the entry with RET would skip the callee entirely, so mid-hook it and
+// log the callee + caller instead.
+static constexpr auto STACK_DESTROYER_TRAMPOLINE_HEAD = "48 89 C8 48 C7 04 24 00 00 00 00";
+static constexpr size_t STACK_DESTROYER_TRAMPOLINE_HEAD_SIZE = 11;
+
+static constexpr uint8_t STACK_DESTROYER_TRAMPOLINE_TAIL_A[] = {0xB9, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xE0};
+static constexpr uint8_t STACK_DESTROYER_TRAMPOLINE_TAIL_B[] = {0x48, 0x89, 0xD1, 0xBA, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xE0};
+
+enum class StackDestroyerTrampolineKind {
+    MovEcxZeroJmpRax, // "mov ecx, 0; jmp rax"
+    MovRcxRdxJmpRax,  // "mov rcx, rdx; mov edx, 0; jmp rax"
+    Unknown,
+};
+
+struct StackDestroyerTrampoline {
+    uintptr_t address{};
+    StackDestroyerTrampolineKind kind{StackDestroyerTrampolineKind::Unknown};
+};
+
+static std::string_view stack_destroyer_trampoline_kind_name(StackDestroyerTrampolineKind kind) {
+    switch (kind) {
+    case StackDestroyerTrampolineKind::MovEcxZeroJmpRax:
+        return "mov ecx,0; jmp rax";
+    case StackDestroyerTrampolineKind::MovRcxRdxJmpRax:
+        return "mov rcx,rdx; mov edx,0; jmp rax";
+    default:
+        return "unrecognised tail";
+    }
+}
+
+// utility::scan() only returns the first hit, so walk the module one byte at a time. The 11-byte
+// head alone is not enough (it also occurs inside longer instruction streams), so classify by the
+// tail that follows it.
+static std::vector<StackDestroyerTrampoline> find_stack_destroyer_trampolines(HMODULE game) {
+    std::vector<StackDestroyerTrampoline> out{};
+
+    const auto size = utility::get_module_size(game);
+
+    if (!size) {
+        return out;
+    }
+
+    const auto end = (uintptr_t)game + *size;
+    auto start = (uintptr_t)game;
+
+    while (start < end) {
+        const auto head = utility::scan(start, end - start, STACK_DESTROYER_TRAMPOLINE_HEAD);
+
+        if (!head) {
+            break;
+        }
+
+        start = *head + 1;
+
+        const auto tail = (const uint8_t*)(*head + STACK_DESTROYER_TRAMPOLINE_HEAD_SIZE);
+
+        if (IsBadReadPtr(tail, sizeof(STACK_DESTROYER_TRAMPOLINE_TAIL_B))) {
+            continue;
+        }
+
+        if (memcmp(tail, STACK_DESTROYER_TRAMPOLINE_TAIL_A, sizeof(STACK_DESTROYER_TRAMPOLINE_TAIL_A)) == 0) {
+            out.push_back({*head, StackDestroyerTrampolineKind::MovEcxZeroJmpRax});
+        } else if (memcmp(tail, STACK_DESTROYER_TRAMPOLINE_TAIL_B, sizeof(STACK_DESTROYER_TRAMPOLINE_TAIL_B)) == 0) {
+            out.push_back({*head, StackDestroyerTrampolineKind::MovRcxRdxJmpRax});
+        } else {
+            out.push_back({*head, StackDestroyerTrampolineKind::Unknown});
+        }
+    }
+
+    return out;
+}
+
+static uintptr_t s_stack_destroyer_trampoline_a{0};
+static uintptr_t s_stack_destroyer_trampoline_b{0};
+
+static void log_stack_destroyer_trampoline(uintptr_t address, safetyhook::Context& ctx) {
+    static std::atomic<uint32_t> s_hits{0};
+
+    const auto hit = s_hits.fetch_add(1, std::memory_order_relaxed);
+    const auto callee = (uintptr_t)ctx.rcx;
+    const auto rsp = (uintptr_t)ctx.rsp;
+
+    // This sits on the game's hot path, so bound the volume. A NULL callee is the fatal `jmp rax`
+    // and is always logged.
+    if (hit >= 32 && callee != 0) {
         return;
     }
 
-    // Create a patch that returns instantly.
-    static auto patch = Patch::create(*fn, { 0xC3 }, true);
+    spdlog::error("[IntegrityCheckBypass]: stack-destroyer trampoline {} hit #{}: rcx(callee) {} rdx 0x{:X} rax 0x{:X} rsp 0x{:X}",
+        describe_address(address), hit, describe_address(callee), (uintptr_t)ctx.rdx, (uintptr_t)ctx.rax, rsp);
 
-    spdlog::info("[IntegrityCheckBypass]: Patched stack destroyer!");
+    // The callers are on the stack the trampoline is about to destroy, so capture it now.
+    const auto deep = hit < 4 || callee == 0;
+
+    if (deep) {
+        log_stack_scan(rsp, 0x40, "trampoline");
+    }
+
+    if (deep) {
+        utility::exceptions::dump_callstack(nullptr);
+    }
+}
+
+static void stack_destroyer_trampoline_a_hook(safetyhook::Context& ctx) {
+    log_stack_destroyer_trampoline(s_stack_destroyer_trampoline_a, ctx);
+}
+
+static void stack_destroyer_trampoline_b_hook(safetyhook::Context& ctx) {
+    log_stack_destroyer_trampoline(s_stack_destroyer_trampoline_b, ctx);
+}
+
+static std::vector<safetyhook::MidHook> s_stack_destroyer_trampoline_hooks{};
+
+static void hook_stack_destroyer_trampolines(HMODULE game) {
+    if (!s_stack_destroyer_trampoline_hooks.empty()) {
+        return;
+    }
+
+    const auto trampolines = find_stack_destroyer_trampolines(game);
+
+    if (trampolines.empty()) {
+        spdlog::error("[IntegrityCheckBypass]: No 1.42.0.2 stack-destroyer trampolines found!");
+        return;
+    }
+
+    for (const auto& trampoline : trampolines) {
+        spdlog::info("[IntegrityCheckBypass]: stack-destroyer trampoline at {} ({})", describe_address(trampoline.address),
+            stack_destroyer_trampoline_kind_name(trampoline.kind));
+
+        // The image is packed, so the bytes in memory are what actually executes.
+        if (const auto original = utility::get_original_bytes(trampoline.address); original && !original->empty()) {
+            std::string bytes{};
+
+            for (const auto b : *original) {
+                bytes += fmt::format("{:02X} ", b);
+            }
+
+            spdlog::warn("[IntegrityCheckBypass]:     on-disk bytes differ from runtime: {}", bytes);
+        }
+    }
+
+    for (const auto& trampoline : trampolines) {
+        const auto is_variant_a = trampoline.kind == StackDestroyerTrampolineKind::MovEcxZeroJmpRax;
+        const auto is_variant_b = trampoline.kind == StackDestroyerTrampolineKind::MovRcxRdxJmpRax;
+
+        if (!is_variant_a && !is_variant_b) {
+            continue;
+        }
+
+        if (is_variant_a) {
+            s_stack_destroyer_trampoline_a = trampoline.address;
+        } else {
+            s_stack_destroyer_trampoline_b = trampoline.address;
+        }
+
+        auto hook = safetyhook::create_mid((void*)trampoline.address,
+            is_variant_a ? &stack_destroyer_trampoline_a_hook : &stack_destroyer_trampoline_b_hook);
+
+        if (!hook) {
+            spdlog::error("[IntegrityCheckBypass]: Failed to hook stack-destroyer trampoline at 0x{:X}!", trampoline.address);
+            continue;
+        }
+
+        s_stack_destroyer_trampoline_hooks.emplace_back(std::move(hook));
+
+        // A mid-hook rewrites the entry with a jump. Read it back so "no hit" cannot be confused
+        // with "the patch was reverted before the gadget ran".
+        std::string live_bytes{};
+
+        for (size_t i = 0; i < 8; ++i) {
+            live_bytes += fmt::format("{:02X} ", ((const uint8_t*)trampoline.address)[i]);
+        }
+
+        spdlog::info("[IntegrityCheckBypass]:     live bytes at 0x{:X}: {}", trampoline.address, live_bytes);
+    }
+
+    spdlog::info("[IntegrityCheckBypass]: Hooked {} stack-destroyer trampoline(s) for diagnostics.",
+        s_stack_destroyer_trampoline_hooks.size());
+}
+
+// The ud2 decoy at 0x14AE46DDF is materialised by exactly five game functions, all the same
+// integrity scanner. Each walks a table of 0x400-byte entries and, for every entry whose first
+// dword is 0x4cbd53e1 and whose first 16 bytes XOR to zero against a fixed key, calls a per-entry
+// handler at [rdi+0x650] passing the ud2 address in rcx:
+//
+//   vmovdqa xmm6, [key]
+//   lea     rsi, [rip+...]        # 0x14AE46DDF
+// .loop:
+//   cmp     dword [rdi], 0x4cbd53e1
+//   jne     .next
+//   vpxor   xmm0, xmm6, [rdi]
+//   vptest  xmm0, xmm0
+//   jne     .next
+//   mov     rcx, rsi              # rcx = the ud2 address
+//   call    qword ptr [rdi+0x650]  <- NULL/ud2 target here is the obvious crash candidate
+// .next:
+//   add     rdi, 0x400
+//   cmp     rdi, rbx
+//   jb      .loop
+//
+// Diagnostic only: log the handler target (and the entry) so a NULL or ud2 handler is visible.
+// Anchor on the wildcard-free magic compare (`cmp dword [rdi], 0x4cbd53e1`); the `lea rsi,[ud2]`
+// sits 7 bytes before it and the per-entry handler call ~22 bytes after. Wildcards do NOT survive
+// utility::scan(start, length, pattern): the wildcard form matched 0 times at runtime while the same
+// 5 sites match in the file, and the wildcard-free trampoline scan worked.
+static constexpr auto STACK_DESTROYER_SCANNER = "81 3F E1 53 BD 4C";
+static constexpr uintptr_t STACK_DESTROYER_SCANNER_LEA_BACK = 7;
+static constexpr auto STACK_DESTROYER_SCANNER_CALL = "FF 97 50 06 00 00";
+
+static void log_stack_destroyer_scanner_call(safetyhook::Context& ctx) {
+    static std::atomic<uint32_t> s_hits{0};
+
+    const auto entry = (uintptr_t)ctx.rdi;
+    const auto target = IsBadReadPtr((void*)(entry + 0x650), sizeof(uintptr_t)) ? 0 : *(const uintptr_t*)(entry + 0x650);
+    const auto hit = s_hits.fetch_add(1, std::memory_order_relaxed);
+
+    // A NULL or non-module handler is the crash candidate; the normal handler is just noise.
+    const auto suspicious = target == 0 || !utility::get_module_within(target).has_value();
+
+    if (hit >= 32 && !suspicious) {
+        return;
+    }
+
+    spdlog::error("[IntegrityCheckBypass]: stack-destroyer scanner call #{}: entry 0x{:X} rcx(ud2) 0x{:X} handler {}", hit, entry,
+        (uintptr_t)ctx.rcx, describe_address(target));
+
+    if (suspicious) {
+        log_stack_scan((uintptr_t)ctx.rsp, 0x40, "scanner");
+    }
+}
+
+static std::vector<safetyhook::MidHook> s_stack_destroyer_scanner_hooks{};
+
+static void hook_stack_destroyer_scanner_calls(HMODULE game) {
+    if (!s_stack_destroyer_scanner_hooks.empty()) {
+        return;
+    }
+
+    const auto size = utility::get_module_size(game);
+
+    if (!size) {
+        return;
+    }
+
+    const auto end = (uintptr_t)game + *size;
+    auto start = (uintptr_t)game;
+
+    while (start < end) {
+        const auto anchor = utility::scan(start, end - start, STACK_DESTROYER_SCANNER);
+
+        if (!anchor) {
+            break;
+        }
+
+        start = *anchor + 1;
+
+        const auto scanner = *anchor - STACK_DESTROYER_SCANNER_LEA_BACK;
+
+        // Must be `lea rsi, [rip+...]` and the wildcard displacement must land on a ud2.
+        if (IsBadReadPtr((void*)scanner, 7) || *(const uint8_t*)(scanner + 1) != 0x8D || *(const uint8_t*)(scanner + 2) != 0x35) {
+            continue;
+        }
+
+        const auto ud2_target = scanner + 7 + *(const int32_t*)(scanner + 3);
+
+        if (IsBadReadPtr((void*)ud2_target, 2) || *(const uint16_t*)ud2_target != 0x0B0F) {
+            continue;
+        }
+
+        // The handler call sits a few instructions further down the same loop body.
+        const auto call = utility::scan(*anchor, 0x40, STACK_DESTROYER_SCANNER_CALL);
+
+        if (!call) {
+            spdlog::error("[IntegrityCheckBypass]: stack-destroyer scanner at {} has no handler call!", describe_address(scanner));
+            continue;
+        }
+
+        spdlog::info("[IntegrityCheckBypass]: stack-destroyer scanner at {} (ud2 0x{:X}) calls handler at {}",
+            describe_address(scanner), ud2_target, describe_address(*call));
+
+        auto hook = safetyhook::create_mid((void*)*call, &log_stack_destroyer_scanner_call);
+
+        if (!hook) {
+            spdlog::error("[IntegrityCheckBypass]: Failed to hook stack-destroyer scanner handler call at 0x{:X}!", *call);
+            continue;
+        }
+
+        s_stack_destroyer_scanner_hooks.emplace_back(std::move(hook));
+    }
+
+    spdlog::info("[IntegrityCheckBypass]: Hooked {} stack-destroyer scanner handler call(s).",
+        s_stack_destroyer_scanner_hooks.size());
+}
+
+// Debug registers are per-thread, so a thread created after arming is uncovered. Re-arm only the
+// newcomers for a while from a throwaway thread; arm_stack_write_watchpoints() ignores TIDs it has
+// already seen, so this stays cheap.
+static DWORD WINAPI stack_watch_rearm_thread(LPVOID) {
+    const auto deadline = GetTickCount64() + 20000;
+
+    while (GetTickCount64() < deadline && !s_stack_watch_disarmed.load(std::memory_order_relaxed)) {
+        arm_stack_write_watchpoints(false);
+        Sleep(20);
+    }
+
+    return 0;
+}
+
+static std::vector<std::unique_ptr<Patch>> s_early_trampoline_patches{};
+
+// The 1.42.0.2 tail-call trampolines wipe the return slot and then `jmp rax` into the ud2 at
+// 0x14AE46DDF, which the VM catches as an exception (the faulting stack carries an EXCEPTION_RECORD
+// with ExceptionCode 0xC000001D and ExceptionAddress 0x14AE46DDF). Only the destructive
+// `mov qword [rsp],0` is removed -- replacing the entry with RET would skip the trap the VM expects.
+static void neutralize_stack_destroyer_trampolines(HMODULE game) {
+    static constexpr uint8_t mov_rsp_zero[] = {0x48, 0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00};
+
+    // trampoline+3 in both the `mov ecx,0` and `mov rcx,rdx; mov edx,0` variants, byte-verified for
+    // 1.42.0.2.
+    for (const auto rva : {0xAE46DBB, 0xAE46DCD}) {
+        const auto address = (uintptr_t)game + rva;
+
+        if (IsBadReadPtr((void*)address, sizeof(mov_rsp_zero)) || memcmp((const void*)address, mov_rsp_zero, sizeof(mov_rsp_zero)) != 0) {
+            diag_log(fmt::format("trampoline neutralise: 0x{:X} is not `mov qword [rsp],0`, skipping", address));
+            continue;
+        }
+
+        s_early_trampoline_patches.emplace_back(Patch::create(address, {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90}, true));
+
+        // If the trampoline still turns out to be the cause we need to know whether the patch stuck.
+        std::string live{};
+
+        for (size_t i = 0; i < 8; ++i) {
+            live += fmt::format("{:02X} ", ((const uint8_t*)address)[i]);
+        }
+
+        diag_log(fmt::format("trampoline neutralise: 0x{:X} now holds {}", address, live));
+    }
+}
+
+// Everything here has to run before the game touches the trampolines and before the frame at
+// 0x1850C3D8 is built: `window at arm time` proved that frame is already fully populated by the time
+// remove_stack_destroyer() runs, so anything installed there only observes the aftermath.
+void IntegrityCheckBypass::early_mhwilds_diagnostics() {
+    // This runs on startup_thread before the REFramework constructor, which is where the log file is
+    // created. A fault in here means no log at all, so nothing may escape and the handler that makes
+    // the DR self-test safe has to exist first.
+    diag_log("early phase: entered");
+    early_log_open();
+    diag_log("early phase: raw early log opened");
+
+    try {
+        if (!sdk::GameIdentity::get().is_mhwilds()) {
+            diag_log("early phase: not mhwilds, skipping");
+            s_early_phase = false;
+            return;
+        }
+
+        const auto game = utility::get_executable();
+
+        if (game == nullptr) {
+            diag_log("early phase: no executable module");
+            s_early_phase = false;
+            return;
+        }
+
+        // Must come first: run_dr_selftest() raises a data-breakpoint trap, and an unhandled
+        // single-step terminates the process before the log file exists.
+        diag_log("early phase: installing first-chance vectored handler");
+        init_first_chance_exception_logger();
+
+        diag_log("early phase: neutralising trampolines");
+        neutralize_stack_destroyer_trampolines(game);
+
+        diag_log("early phase: arming stack write watchpoints");
+        arm_stack_write_watchpoints();
+
+        diag_log("early phase: starting re-arm thread");
+        CreateThread(nullptr, 0, stack_watch_rearm_thread, nullptr, 0, nullptr);
+
+        diag_log("early phase: done");
+    } catch (...) {
+        diag_log("early phase: caught a C++ exception; continuing without early diagnostics");
+        s_early_phase = false;
+    }
+}
+
+void IntegrityCheckBypass::remove_stack_destroyer() {
+    flush_early_log();
+
+    spdlog::info("[IntegrityCheckBypass]: Searching for stack destroyer...");
+
+    const auto game = utility::get_executable();
+
+    if (game == nullptr) {
+        spdlog::error("[IntegrityCheckBypass]: "
+                      "Could not obtain executable module!");
+        return;
+    }
+    const auto module_base = reinterpret_cast<uintptr_t>(game);
+
+    // The .data trampoline below is the one that actually faults, so hook it independently of
+    // whether the .udata pivot is found (or matched) at all.
+    if (sdk::GameIdentity::get().is_mhwilds()) {
+        hook_stack_destroyer_trampolines(game);
+        hook_stack_destroyer_scanner_calls(game);
+
+        // Catch the store that wipes the return slot, and neutralise it in place.
+        arm_stack_write_watchpoints();
+    }
+
+    const auto legacy = utility::scan(game, "48 89 11 "
+                                            "48 C7 04 24 00 00 00 00 "
+                                            "48 81 C4 28 01 00 00");
+
+    if (legacy) {
+        spdlog::info("[IntegrityCheckBypass]: "
+                     "Found legacy stack destroyer at RVA 0x{:X}",
+            *legacy - module_base);
+
+        static auto patch = Patch::create(*legacy, {0xC3}, true);
+
+        spdlog::info("[IntegrityCheckBypass]: "
+                     "Patched legacy stack destroyer!");
+        return;
+    }
+
+    // Newer games (MHWilds) no longer contain the SF6 shape above. The stack destroyer moved into
+    // the obfuscated, self-modifying .udata section and is now expressed as a stack-pivot gadget
+    // that rewrites the return address on the stack:
+    //
+    // mov     rbx, [rsp]
+    // mov     qword ptr [rsp], 0
+    // sub     qword ptr [rsp], rbp
+    // mov     rbp, [rsp]
+    // lea     rdx, [rip+...]
+    // lea     rsp, [rsp+8]
+    // xchg    qword ptr [rsp], rdx
+    // add     rsp, -8
+    //
+    // This pattern only points at the middle of the gadget. Patching there would RET into whatever
+    // the gadget has already pushed, so resolve the real entry first.
+    const auto candidate = utility::scan(game, "48 8B 1C 24 "
+                                               "48 C7 04 24 00 00 00 00 "
+                                               "48 29 2C 24 "
+                                               "48 8B 2C 24 "
+                                               "48 8D 15 ? ? ? ? "
+                                               "48 8D A4 24 08 00 00 00 "
+                                               "48 87 14 24 "
+                                               "48 83 C4 F8");
+
+    if (!candidate) {
+        spdlog::error("[IntegrityCheckBypass]: "
+                      "Could not find legacy or 1.42.0.2 "
+                      "stack-destroyer candidate!");
+        return;
+    }
+
+    spdlog::info("[IntegrityCheckBypass]: "
+                 "Found 1.42.0.2 stack-destroyer candidate "
+                 "at RVA 0x{:X}",
+        *candidate - module_base);
+
+    if (const auto entry = find_stack_destroyer_entry(*candidate, module_base)) {
+        spdlog::info("[IntegrityCheckBypass]: "
+                     "Resolved 1.42.0.2 stack destroyer entry "
+                     "at RVA 0x{:X}",
+            *entry - module_base);
+    } else {
+        spdlog::warn("[IntegrityCheckBypass]: "
+                     "Could not resolve 1.42.0.2 stack destroyer entry");
+    }
+
+    // Diagnostic-only. The on-disk image does not match what the packer executes at runtime: .udata
+    // is MEM_WRITE and gets rewritten, so the entry/gadget we resolve statically is not necessarily
+    // the code that runs. Patching it corrupts packer/VM setup (crash within ~300ms of the patch).
+    // Dump the live bytes around the candidate so the real target can be identified from the running
+    // process instead of from the file.
+    const auto dump_start = *candidate - 0x10;
+    const auto dump_end = *candidate + 0x30;
+
+    std::stringstream bytes{};
+    bytes << std::hex << std::setfill('0');
+
+    for (auto addr = dump_start; addr < dump_end; ++addr) {
+        bytes << std::setw(2) << (uint32_t)*(uint8_t*)addr << " ";
+    }
+
+    spdlog::info("[IntegrityCheckBypass]: "
+                 "Runtime bytes RVA 0x{:X} - 0x{:X}: {}",
+        dump_start - module_base, dump_end - module_base, bytes.str());
+
+    spdlog::warn("[IntegrityCheckBypass]: "
+                 "1.42.0.2 stack-destroyer candidate located; "
+                 "diagnostic-only mode, no patch applied!");
 }
 
 void IntegrityCheckBypass::setup_pristine_syscall() {
@@ -2541,6 +3904,10 @@ void* IntegrityCheckBypass::rtl_exit_user_process_hook(uint32_t code) {
         return nullptr;
     }*/
 
+    spdlog::error("[IntegrityCheckBypass]: RtlExitUserProcess called with code 0x{:X} from 0x{:X}", code, (uintptr_t)_ReturnAddress());
+
+    utility::exceptions::dump_callstack(nullptr);
+
     // ok for some reason I can't explain yet,
     // we need to do this because the game crashes if we don't
     // It seems to have something to do with RtlpFlsDataCleanup (which is called by RtlExitUserProcess)
@@ -2751,10 +4118,22 @@ void IntegrityCheckBypass::directstorage_open_pak_hook_wrappper(safetyhook::Cont
 }
 
 void IntegrityCheckBypass::correct_pak_load_path(safetyhook::Context& context, int register_index) {
-    static bool once = false;
-    if (!once) {
-        spdlog::info("[IntegrityCheckBypass]: correct_pak_load_path called, register index: {}", register_index);
-        once = true;
+    static std::atomic<uint32_t> s_call_count{0};
+    const auto call_index = s_call_count.fetch_add(1);
+    if (call_index < 4) {
+        auto* path_ptr = disasm_utils::get_register_value<wchar_t*>(context, register_index);
+        const auto path_ok = path_ptr != nullptr && !IsBadStringPtrW(path_ptr, 1024);
+        const std::string path_str = path_ok ? utility::narrow(path_ptr) : std::string{"<bad>"};
+        spdlog::info("[IntegrityCheckBypass]: correct_pak_load_path #{} register {} path '{}'", call_index, register_index, path_str);
+
+        // The trampoline the mid-hook landed in is exactly where dump_callstack() stops, so the
+        // game frames below it -- the integrity check that decided to open the crash-report file --
+        // are only reachable from the live RSP.
+        log_stack_scan((uintptr_t)context.rsp, 0x100, "pak-open");
+
+        if (call_index == 0) {
+            utility::exceptions::dump_callstack(nullptr);
+        }
     }
 
     if (!m_load_pak_directory || !m_load_pak_directory->value() || m_custom_pak_in_directory_paths.empty()) {

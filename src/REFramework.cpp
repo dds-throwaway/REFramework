@@ -495,6 +495,7 @@ REFramework::REFramework(HMODULE reframework_module)
 
     if (gi.is_re8()) {
         auto startup_lookup_thread = std::make_unique<std::thread>([this]() {
+            spdlog::info("[Thread] startup_lookup_thread TID {}", GetCurrentThreadId());
             // Fixes a crash on some machines when starting the game
             // This one has nothing to do with integrity checks
             // it has something to do with the Agility SDK and pipeline state.
@@ -715,6 +716,7 @@ REFramework::REFramework(HMODULE reframework_module)
     m_last_present_time = std::chrono::steady_clock::now();
     m_last_message_time = std::chrono::steady_clock::now();
     m_d3d_monitor_thread = std::make_unique<std::jthread>([this](std::stop_token stop_token) {
+        spdlog::info("[Thread] d3d_monitor_thread TID {}", GetCurrentThreadId());
         while (!stop_token.stop_requested() && !m_terminating) {
             this->hook_monitor();
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -2339,6 +2341,7 @@ bool REFramework::initialize_game_data() {
 
     // Game specific initialization stuff
     std::thread init_thread([this]() {
+        spdlog::info("[Thread] init_thread TID {}", GetCurrentThreadId());
         std::scoped_lock _{this->m_startup_mutex};
 
         const auto& gi = sdk::GameIdentity::get();

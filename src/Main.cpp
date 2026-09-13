@@ -81,6 +81,12 @@ __declspec(dllexport) HRESULT WINAPI
 }
 
 void startup_thread(HMODULE reframework_module) {
+    spdlog::info("[Thread] startup_thread TID {}", GetCurrentThreadId());
+
+    // The crash frame at 0x1850C3D8 is already fully populated (return slot already 0) long before
+    // REFramework's integrity bypass runs, so the watchpoint arming and the trampoline fix have to be
+    // installed here, before anything else touches the game.
+    IntegrityCheckBypass::early_mhwilds_diagnostics();
     // We will set it once here, then do it continuously
     // every now and then because it gets replaced
     reframework::setup_exception_handler();

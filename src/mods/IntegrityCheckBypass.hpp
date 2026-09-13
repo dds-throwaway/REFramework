@@ -36,6 +36,10 @@ public:
     static void re9_heartbeat_bypass();
     static void remove_stack_destroyer();
 
+    // Must run from startup_thread BEFORE the REFramework constructor: the crash frame is already
+    // built by the time remove_stack_destroyer() runs.
+    static void early_mhwilds_diagnostics();
+
     static void setup_pristine_syscall();
     static void fix_virtual_protect();
 
