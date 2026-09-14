@@ -86,7 +86,10 @@ void startup_thread(HMODULE reframework_module) {
     // The crash frame at 0x1850C3D8 is already fully populated (return slot already 0) long before
     // REFramework's integrity bypass runs, so the watchpoint arming and the trampoline fix have to be
     // installed here, before anything else touches the game.
-    IntegrityCheckBypass::early_mhwilds_diagnostics();
+    IntegrityCheckBypass::load_early_switches();
+
+    if (!IntegrityCheckBypass::diagnostics_disabled()) IntegrityCheckBypass::early_mhwilds_diagnostics();
+    else spdlog::warn("[IntegrityCheckBypass]: diagnostics SKIPPED (Early_DisableDiagnostics).");
     // We will set it once here, then do it continuously
     // every now and then because it gets replaced
     reframework::setup_exception_handler();
@@ -148,9 +151,16 @@ BOOL APIENTRY DllMain(HANDLE handle, DWORD reason, LPVOID reserved) {
         // Safe under loader lock: detection is just GetModuleFileNameW.
         sdk::GameIdentity::initialize();
 
-        IntegrityCheckBypass::setup_pristine_syscall();
-        IntegrityCheckBypass::hook_add_vectored_exception_handler();
-        IntegrityCheckBypass::hook_rtl_exit_user_process();
+        // Read the group switches before the always-on hooks go in: these are installed here under the
+        // loader lock, long before startup_thread could read them. load_early_switches() derives the
+        // config path with Win32 only (no std::filesystem) so it is safe at this point.
+        IntegrityCheckBypass::load_early_switches();
+
+        const auto hooks_off = IntegrityCheckBypass::hooks_disabled();
+
+        if (!hooks_off) IntegrityCheckBypass::setup_pristine_syscall();
+        if (!hooks_off) IntegrityCheckBypass::hook_add_vectored_exception_handler();
+        if (!hooks_off) IntegrityCheckBypass::hook_rtl_exit_user_process();
 
         CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)startup_thread, handle, 0, nullptr);
     }

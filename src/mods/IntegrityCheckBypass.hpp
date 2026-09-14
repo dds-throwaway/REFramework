@@ -40,6 +40,24 @@ public:
     // built by the time remove_stack_destroyer() runs.
     static void early_mhwilds_diagnostics();
 
+    // Reads the bisect switches straight off re2_fw_config.txt during the early phase. Must be a
+    // member: the switches are private static members, so a free function cannot name them.
+    static void load_bisect_config();
+
+    // ---- early group switches -------------------------------------------------------------------
+    // Group switches for the parts of REFramework that are NOT integrity-bypass patches: the module
+    // spoof, the always-on hooks, the exception handler, the mods and the always-on diagnostics.
+    // Registered options like the patches, but they have to be resolved at the very start of DllMain
+    // -- long before the normal mod config load -- so load_early_switches() reads them there.
+    static void load_early_switches();
+    static bool diagnostics_disabled();
+    static bool module_spoof_disabled();
+    static bool hooks_disabled();
+    static bool exception_handler_disabled();
+    static bool mods_disabled();
+    // FaultyFileDetector has no ModToggle of its own, so it gets a switch here.
+    static bool faulty_file_detector_disabled();
+
     static void setup_pristine_syscall();
     static void fix_virtual_protect();
 
@@ -133,6 +151,36 @@ private:
 
     const ModToggle::Ptr m_load_pak_directory{ ModToggle::create(generate_name("LoadPakDirectory"), true) };
 
+    // Bisect switches for the integrity bypass. Every one defaults to the behaviour the game needs;
+    // turning one off is a diagnosis tool, not a mode. Keys are IntegrityCheckBypass_<Name> in
+    // re2_fw_config.txt. `DisableAllPatches` skips every bypass patch while leaving all diagnostics
+    // (VEH, watchers, early phase) running, so "does the crash depend on our patches at all?" is a
+    // single re-run rather than a rebuild.
+    static inline const ModToggle::Ptr m_disable_all_patches{ ModToggle::create("IntegrityCheckBypass_DisableAllPatches", false) };
+    static inline const ModToggle::Ptr m_patch_crash_report_check{ ModToggle::create("IntegrityCheckBypass_PatchCrashReportCheck", true) };
+    // Instead of forcing the "file missing" branch (which skips launching CrashReport.exe entirely),
+    // let the reporter run and force the outcome to "continue". Both paths converge on the same
+    // continuation, so the only difference is whether the reporter actually ran first.
+    static inline const ModToggle::Ptr m_crash_report_force_continue{ ModToggle::create("IntegrityCheckBypass_CrashReportCheckForceContinue", false) };
+    static inline const ModToggle::Ptr m_patch_scanner_crasher{ ModToggle::create("IntegrityCheckBypass_PatchScannerCrasher", true) };
+    static inline const ModToggle::Ptr m_hook_create_blas{ ModToggle::create("IntegrityCheckBypass_HookCreateBLAS", true) };
+    static inline const ModToggle::Ptr m_patch_sus_constants{ ModToggle::create("IntegrityCheckBypass_PatchSusConstants", true) };
+    static inline const ModToggle::Ptr m_patch_pak_integrity{ ModToggle::create("IntegrityCheckBypass_PatchPakIntegrity", true) };
+    static inline const ModToggle::Ptr m_patch_stack_destroyer{ ModToggle::create("IntegrityCheckBypass_PatchStackDestroyer", true) };
+
+    // Group switches for the features that REFramework installs from DllMain or the startup thread
+    // before mod configs are loaded. Ordinary registered options -- save_config() preserves them and
+    // the UI shows them -- but they have to be resolved early, which is what the prefix marks.
+    // Defaults are the shipping behaviour: diagnostics off, everything else on. Turning one on (or
+    // diagnostics on) is a diagnosis tool, not a mode.
+    static inline const ModToggle::Ptr m_early_minimal{ ModToggle::create("Early_Minimal", false) };
+    static inline const ModToggle::Ptr m_early_disable_diagnostics{ ModToggle::create("Early_DisableDiagnostics", true) };
+    static inline const ModToggle::Ptr m_early_disable_module_spoof{ ModToggle::create("Early_DisableModuleSpoof", false) };
+    static inline const ModToggle::Ptr m_early_disable_hooks{ ModToggle::create("Early_DisableHooks", false) };
+    static inline const ModToggle::Ptr m_early_disable_exception_handler{ ModToggle::create("Early_DisableExceptionHandler", false) };
+    static inline const ModToggle::Ptr m_early_disable_mods{ ModToggle::create("Early_DisableMods", false) };
+    static inline const ModToggle::Ptr m_early_disable_faulty_file_detector{ ModToggle::create("Early_DisableFaultyFileDetector", false) };
+
     static inline std::vector<safetyhook::MidHook> s_before_create_file_w_hooks{};
     static inline safetyhook::MidHook s_directstorage_open_pak_hook{};
     static inline int s_base_directory_patch_count{0};
@@ -161,7 +209,22 @@ private:
     std::wregex m_sub_patch_scan_regex{SUB_PATCH_SCAN_REGEX, std::regex::ECMAScript};
 
     ValueList m_options{
-        *m_load_pak_directory
+        *m_load_pak_directory,
+        *m_disable_all_patches,
+        *m_patch_crash_report_check,
+        *m_crash_report_force_continue,
+        *m_patch_scanner_crasher,
+        *m_hook_create_blas,
+        *m_patch_sus_constants,
+        *m_patch_pak_integrity,
+        *m_patch_stack_destroyer,
+        *m_early_minimal,
+        *m_early_disable_diagnostics,
+        *m_early_disable_module_spoof,
+        *m_early_disable_hooks,
+        *m_early_disable_exception_handler,
+        *m_early_disable_mods,
+        *m_early_disable_faulty_file_detector
     };
 #pragma endregion 
 };

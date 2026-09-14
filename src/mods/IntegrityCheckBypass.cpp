@@ -28,6 +28,8 @@
 #include <sdk/GameIdentity.hpp>
 
 #include "Hooks.hpp"
+#include "REFramework.hpp"
+#include "LooseFileLoader.hpp"
 
 #include "IntegrityCheckBypass.hpp"
 #include "DisasmUtils.hpp"
@@ -319,7 +321,10 @@ static void arm_stack_write_watchpoints(bool report = true) {
         return;
     }
 
-    const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    // TH32CS_SNAPTHREAD ignores this on Windows, but Wine uses it to scope the enumeration: with 0
+    // it returns a couple of threads while the ThreadSuspender (which passes the pid) sees 98.
+    const auto pid = GetCurrentProcessId();
+    const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, pid);
 
     if (snapshot == INVALID_HANDLE_VALUE) {
         diag_log("could not snapshot threads to arm stack watchpoints");
@@ -329,9 +334,16 @@ static void arm_stack_write_watchpoints(bool report = true) {
     THREADENTRY32 entry{};
     entry.dwSize = sizeof(entry);
 
-    const auto pid = GetCurrentProcessId();
     const auto self = GetCurrentThreadId();
     uint32_t armed = 0;
+
+    // Every failure below used to `continue` silently, which is how "armed 0 threads" produced a
+    // run with no information at all. Count them and report in the summary.
+    uint32_t skipped_open = 0;
+    uint32_t skipped_suspend = 0;
+    uint32_t skipped_query = 0;
+    uint32_t skipped_no_stack_base = 0;
+    uint32_t skipped_context = 0;
 
     for (auto ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
         if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) {
@@ -349,10 +361,12 @@ static void arm_stack_write_watchpoints(bool report = true) {
         const auto thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID);
 
         if (thread == nullptr) {
+            ++skipped_open;
             continue;
         }
 
         if (SuspendThread(thread) == (DWORD)-1) {
+            ++skipped_suspend;
             CloseHandle(thread);
             continue;
         }
@@ -360,7 +374,8 @@ static void arm_stack_write_watchpoints(bool report = true) {
         // Per-thread window, derived from this thread's own stack base.
         ThreadBasicInfo info{};
 
-        if (nt_query_information_thread(thread, 0 /*ThreadBasicInformation*/, &info, sizeof(info), nullptr) < 0) {
+        if (nt_query_information_thread(thread, 0 /*ThreadBasicInformation*/, &info, sizeof(info), nullptr) < 0 || info.teb == nullptr) {
+            ++skipped_query;
             ResumeThread(thread);
             CloseHandle(thread);
             continue;
@@ -375,7 +390,11 @@ static void arm_stack_write_watchpoints(bool report = true) {
         uintptr_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
         auto sampled = false;
 
-        if (watch != 0 && GetThreadContext(thread, &ctx)) {
+        if (watch == 0) {
+            ++skipped_no_stack_base;
+        } else if (!GetThreadContext(thread, &ctx)) {
+            ++skipped_context;
+        } else {
             ctx.Dr0 = watch;
             ctx.Dr1 = watch + 8;
             ctx.Dr2 = watch + 16;
@@ -416,6 +435,8 @@ static void arm_stack_write_watchpoints(bool report = true) {
 
     diag_log(fmt::format("armed stack write watchpoints on {} new thread(s); window = StackBase-0x{:X}..-0x{:X}", armed,
         STACK_WATCH_FROM_BASE, STACK_WATCH_FROM_BASE - STACK_WATCH_SIZE));
+    diag_log(fmt::format("  skipped: open {} suspend {} query {} no-stack-base {} get-context {}", skipped_open, skipped_suspend,
+        skipped_query, skipped_no_stack_base, skipped_context));
 
     // This thread's own window, so there is always a sample of what the frame looks like at arm time
     // even if the crashing thread did not exist yet.
@@ -675,6 +696,10 @@ LONG CALLBACK first_chance_exception_logger(EXCEPTION_POINTERS* ei) {
 }
 
 void init_first_chance_exception_logger() {
+    if (IntegrityCheckBypass::diagnostics_disabled()) {
+        return;
+    }
+
     static bool s_initialized = false;
 
     if (s_initialized) {
@@ -748,6 +773,60 @@ void init_terminate_process_watcher() {
     }
 
     spdlog::info("[IntegrityCheckBypass]: Hooked NtTerminateProcess for diagnostics.");
+}
+
+using UnhandledExceptionFilter_t = LONG(WINAPI*)(EXCEPTION_POINTERS*);
+
+std::unique_ptr<FunctionHook> s_unhandled_exception_filter_hook{};
+
+// The crash report itself is fabricated, not a fault. The minidump's exception stream for thread 392
+// reads code 0xC000001D with ExceptionAddress 0x14AE46DDF -- the game's own ud2 -- and an ENTIRELY
+// ZEROED CONTEXT, and global_exception_handler logs `_ReturnAddress() == nullptr`. A real ud2 fault
+// carries a valid context with RIP at the ud2. So the game builds an EXCEPTION_RECORD and hands it to
+// the unhandled filter: that call is the anti-tamper's "report" step, and its caller's stack is still
+// intact here -- unlike at the fatal, where the return slot is already 0.
+LONG WINAPI unhandled_exception_filter_hook(EXCEPTION_POINTERS* ei) {
+    const auto retaddr = (uintptr_t)_ReturnAddress();
+
+    spdlog::error("[IntegrityCheckBypass]: UnhandledExceptionFilter from 0x{:X} ({}) code 0x{:X} address 0x{:X}", retaddr,
+        describe_address(retaddr),
+        ei != nullptr && ei->ExceptionRecord != nullptr ? ei->ExceptionRecord->ExceptionCode : 0,
+        ei != nullptr && ei->ExceptionRecord != nullptr ? (uintptr_t)ei->ExceptionRecord->ExceptionAddress : 0);
+
+    log_stack_scan((uintptr_t)_AddressOfReturnAddress(), 0x60, "uef");
+
+    if (s_unhandled_exception_filter_hook != nullptr) {
+        return s_unhandled_exception_filter_hook->get_original<decltype(unhandled_exception_filter_hook)>()(ei);
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Installed during the early phase: the fabricated exception fires ~48 ms into startup, long before
+// immediate_patch_dd2()/remove_stack_destroyer() run.
+void init_unhandled_exception_filter_watcher() {
+    if (s_unhandled_exception_filter_hook != nullptr) {
+        return;
+    }
+
+    const auto kernelbase = GetModuleHandleW(L"kernelbase.dll");
+    const auto target = kernelbase != nullptr ? GetProcAddress(kernelbase, "UnhandledExceptionFilter") : nullptr;
+
+    if (target == nullptr) {
+        diag_log("could not resolve UnhandledExceptionFilter");
+        return;
+    }
+
+    s_unhandled_exception_filter_hook =
+        std::make_unique<FunctionHook>((uintptr_t)target, (uintptr_t)&unhandled_exception_filter_hook);
+
+    if (!s_unhandled_exception_filter_hook->create()) {
+        diag_log("failed to hook UnhandledExceptionFilter");
+        s_unhandled_exception_filter_hook.reset();
+        return;
+    }
+
+    diag_log(fmt::format("hooked UnhandledExceptionFilter at 0x{:X}", (uintptr_t)target));
 }
 
 std::unique_ptr<FunctionHook> s_report_gsfailure_hook{};
@@ -1477,6 +1556,10 @@ void IntegrityCheckBypass::anti_debug_watcher() try {
 }
 
 void IntegrityCheckBypass::init_anti_debug_watcher() {
+    if (hooks_disabled()) {
+        return;
+    }
+
     if (s_anti_anti_debug_thread != nullptr) {
         return;
     }
@@ -1879,6 +1962,11 @@ void IntegrityCheckBypass::sha3_rsa_code_midhook(safetyhook::Context& context) {
 }
 
 void IntegrityCheckBypass::restore_unencrypted_paks() {
+    if (m_disable_all_patches->value() || !m_patch_pak_integrity->value()) {
+        spdlog::warn("[IntegrityCheckBypass]: Pak integrity patches SKIPPED (config).");
+        return;
+    }
+
     spdlog::info("[IntegrityCheckBypass]: Restoring unencrypted paks...");
 
     scan_patch_files_count();
@@ -2141,11 +2229,56 @@ void IntegrityCheckBypass::immediate_patch_dd2() {
             // ShellExecuteExW: that path sets edi=1 and makes the caller treat the check as failed.
             // Instead force the PathFileExistsW branch to fall through to the "file does not exist"
             // continue path, which returns 0.
-            if (const auto crash_report_launch = utility::scan(game, "48 8D 3D ? ? ? ? 48 89 F9 FF 15 ? ? ? ? 85 C0 75 ?")) {
-                static auto crash_report_patch = Patch::create(*crash_report_launch + 18, {0x90, 0x90}, true);
-                spdlog::info("[IntegrityCheckBypass]: Patched MHWilds CrashReport.exe check (site 1)!");
+            if (!m_disable_all_patches->value() && m_patch_crash_report_check->value()) {
+                if (const auto crash_report_launch = utility::scan(game, "48 8D 3D ? ? ? ? 48 89 F9 FF 15 ? ? ? ? 85 C0 75 ?")) {
+                    // The jne is at +18; both the fall-through and the "child exited 0xCD" targets
+                    // converge on +20, which calls the same continuation (sub_14A4D6090 -- the thing
+                    // that opens Temp\ReEngine\WER\info-*.txt).
+                    const auto continue_at = *crash_report_launch + 20;
+
+                    if (m_crash_report_force_continue->value()) {
+                        // Leave the reporter enabled and force the outcome to "continue" instead of
+                        // skipping it. Scan for the instruction after `call [ExitProcess]`; the call is
+                        // 6 bytes and the `xor ecx,ecx` before it starts 8 bytes earlier.
+                        const auto exit_tail = utility::scan(*crash_report_launch, 0x300, "4C 89 F1 89 EA FF D0");
+
+                        if (exit_tail) {
+                            const auto patch_at = *exit_tail - 8;
+
+                            // Must be `xor ecx,ecx; call [rip+..]` before we overwrite five bytes of it.
+                            if (!IsBadReadPtr((void*)patch_at, 4) && *(const uint32_t*)patch_at == 0x15FFC931) {
+                                const auto rel = (int32_t)((intptr_t)continue_at - (intptr_t)(patch_at + 5));
+
+                                static auto force_continue_patch = Patch::create(patch_at,
+                                    {0xE9, (uint8_t)(rel & 0xFF), (uint8_t)((rel >> 8) & 0xFF), (uint8_t)((rel >> 16) & 0xFF),
+                                        (uint8_t)((rel >> 24) & 0xFF)},
+                                    true);
+
+                                spdlog::info("[IntegrityCheckBypass]: MHWilds CrashReport.exe check: reporter left ENABLED, forcing the"
+                                             " continue outcome (0x{:X} -> 0x{:X}).",
+                                    patch_at, continue_at);
+                            } else {
+                                spdlog::error("[IntegrityCheckBypass]: MHWilds CrashReport.exe check: unexpected bytes at 0x{:X};"
+                                              " using the fall-through patch instead.",
+                                    patch_at);
+
+                                static auto fallback_patch = Patch::create(*crash_report_launch + 18, {0x90, 0x90}, true);
+                            }
+                        } else {
+                            spdlog::error("[IntegrityCheckBypass]: MHWilds CrashReport.exe check: could not find the ExitProcess path;"
+                                          " using the fall-through patch instead.");
+
+                            static auto fallback_patch = Patch::create(*crash_report_launch + 18, {0x90, 0x90}, true);
+                        }
+                    } else {
+                        static auto crash_report_patch = Patch::create(*crash_report_launch + 18, {0x90, 0x90}, true);
+                        spdlog::info("[IntegrityCheckBypass]: Patched MHWilds CrashReport.exe check (site 1)!");
+                    }
+                } else {
+                    spdlog::error("[IntegrityCheckBypass]: Could not find MHWilds CrashReport.exe check (site 1)!");
+                }
             } else {
-                spdlog::error("[IntegrityCheckBypass]: Could not find MHWilds CrashReport.exe check (site 1)!");
+                spdlog::warn("[IntegrityCheckBypass]: CrashReport.exe check patch SKIPPED (config).");
             }
 
             init_terminate_process_watcher();
@@ -2153,7 +2286,8 @@ void IntegrityCheckBypass::immediate_patch_dd2() {
     const auto query_performance_frequency = &QueryPerformanceFrequency;
     const auto query_performance_counter = &QueryPerformanceCounter;
 
-    if (query_performance_frequency != nullptr && query_performance_counter != nullptr) {
+    if (query_performance_frequency != nullptr && query_performance_counter != nullptr && !m_disable_all_patches->value() &&
+        m_patch_scanner_crasher->value()) {
         const auto qpf_import = utility::scan_ptr(game, (uintptr_t)query_performance_frequency);
         const auto qpc_import = utility::scan_ptr(game, (uintptr_t)query_performance_counter);
 
@@ -2222,7 +2356,8 @@ void IntegrityCheckBypass::immediate_patch_dd2() {
     }
     }
 
-    if (const auto create_blas_fn = utility::find_function_from_string_ref(game, "createBLAS"); create_blas_fn.has_value()) {
+    if (const auto create_blas_fn = utility::find_function_from_string_ref(game, "createBLAS");
+        create_blas_fn.has_value() && !m_disable_all_patches->value() && m_hook_create_blas->value()) {
         const auto create_blas_fn_unwind = utility::find_function_start_unwind(*create_blas_fn);
 
         if (create_blas_fn_unwind) {
@@ -2254,15 +2389,19 @@ void IntegrityCheckBypass::immediate_patch_dd2() {
 
     static std::vector<Patch::Ptr> sus_constant_patches{};
 
-    for (auto ref = utility::scan(game, "81 ? E1 53 BD 4C");
-         ref.has_value();
-         ref = utility::scan(*ref + 1, (game_end - (*ref + 1)) - 0x1000, "81 ? E1 53 BD 4C"))
-    {
-        // Patch to 0x1337BEEF
-        sus_constant_patches.emplace_back(Patch::create(*ref + 2, { 0xEF, 0xBE, 0x37, 0x13 }, true));
-    }
+    if (m_disable_all_patches->value() || !m_patch_sus_constants->value()) {
+        spdlog::warn("[IntegrityCheckBypass]: sus_constants patch SKIPPED (config).");
+    } else {
+        for (auto ref = utility::scan(game, "81 ? E1 53 BD 4C");
+             ref.has_value();
+             ref = utility::scan(*ref + 1, (game_end - (*ref + 1)) - 0x1000, "81 ? E1 53 BD 4C"))
+        {
+            // Patch to 0x1337BEEF
+            sus_constant_patches.emplace_back(Patch::create(*ref + 2, { 0xEF, 0xBE, 0x37, 0x13 }, true));
+        }
 
-    spdlog::info("[IntegrityCheckBypass]: Patched {} sus_constants! (DD2+ variant)", sus_constant_patches.size());
+        spdlog::info("[IntegrityCheckBypass]: Patched {} sus_constants! (DD2+ variant)", sus_constant_patches.size());
+    }
 
     restore_unencrypted_paks();
     }
@@ -3500,6 +3639,116 @@ static void neutralize_stack_destroyer_trampolines(HMODULE game) {
     }
 }
 
+// The integrity bypass runs (REFramework.cpp:542/552) *before* REFramework loads mod configs
+// (Mods.cpp:100 via REFramework.cpp:602), so the bisect switches have to be read straight off the file
+// during the early phase. Without this every one of them would silently read its default and the
+// bisect would look like "the patch makes no difference".
+//
+// Exe-directory paths only -- no std::filesystem, no get_persistent_dir() -- because this also runs
+// from DllMain, where the loader lock is held.
+static std::string exe_dir_file(const wchar_t* filename) {
+    wchar_t module_path[MAX_PATH]{};
+
+    if (GetModuleFileNameW(nullptr, module_path, MAX_PATH) == 0) {
+        return {};
+    }
+
+    std::wstring path{module_path};
+    const auto slash = path.find_last_of(L"\\/");
+
+    if (slash == std::wstring::npos) {
+        return {};
+    }
+
+    return utility::narrow(path.substr(0, slash + 1) + filename);
+}
+
+static std::atomic<bool> s_early_switches_loaded{false};
+static std::atomic<bool> s_disable_diagnostics{false};
+static std::atomic<bool> s_disable_module_spoof{false};
+static std::atomic<bool> s_disable_hooks{false};
+static std::atomic<bool> s_disable_exception_handler{false};
+static std::atomic<bool> s_disable_mods{false};
+static std::atomic<bool> s_disable_faulty_file_detector{false};
+
+bool IntegrityCheckBypass::diagnostics_disabled() { return s_disable_diagnostics.load(std::memory_order_relaxed); }
+bool IntegrityCheckBypass::module_spoof_disabled() { return s_disable_module_spoof.load(std::memory_order_relaxed); }
+bool IntegrityCheckBypass::hooks_disabled() { return s_disable_hooks.load(std::memory_order_relaxed); }
+bool IntegrityCheckBypass::exception_handler_disabled() { return s_disable_exception_handler.load(std::memory_order_relaxed); }
+bool IntegrityCheckBypass::mods_disabled() { return s_disable_mods.load(std::memory_order_relaxed); }
+bool IntegrityCheckBypass::faulty_file_detector_disabled() { return s_disable_faulty_file_detector.load(std::memory_order_relaxed); }
+
+// Idempotent: DllMain reads it before installing the always-on hooks, startup_thread may call it again.
+void IntegrityCheckBypass::load_early_switches() {
+    if (s_early_switches_loaded.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+
+    // Resolve every switch -- the Early_* group switches and the IntegrityCheckBypass_* patches --
+    // here, in DllMain, before anything reads them. Previously the group switches came from a separate
+    // file (because save_config() drops keys REFramework does not own) and the patches were loaded in
+    // early_mhwilds_diagnostics(), so every run with diagnostics off silently ran the patches at their
+    // code defaults. Now they are ordinary registered options and this is the single place they are
+    // read early.
+    load_bisect_config();
+
+    const auto minimal = m_early_minimal->value();
+
+    s_disable_diagnostics = minimal || m_early_disable_diagnostics->value();
+    s_disable_module_spoof = minimal || m_early_disable_module_spoof->value();
+    s_disable_hooks = minimal || m_early_disable_hooks->value();
+    s_disable_exception_handler = minimal || m_early_disable_exception_handler->value();
+    s_disable_mods = minimal || m_early_disable_mods->value();
+    s_disable_faulty_file_detector = minimal || m_early_disable_faulty_file_detector->value();
+}
+
+void IntegrityCheckBypass::load_bisect_config() {
+    try {
+        // Win32-derived path first: this also runs from DllMain (via load_early_switches), where
+        // std::filesystem and get_persistent_dir() are not safe to touch. The persistent-dir path is
+        // the same file for mhwilds; the fallback keeps other games working.
+        auto path = exe_dir_file(L"re2_fw_config.txt");
+
+        if (path.empty()) {
+            path = REFramework::get_persistent_dir("re2_fw_config.txt").string();
+        }
+
+        utility::Config cfg{ path };
+
+        for (const auto option : {m_disable_all_patches.get(), m_patch_crash_report_check.get(), m_crash_report_force_continue.get(),
+                 m_patch_scanner_crasher.get(),
+                 m_hook_create_blas.get(), m_patch_sus_constants.get(), m_patch_pak_integrity.get(),
+                 m_patch_stack_destroyer.get(),
+                 m_early_minimal.get(), m_early_disable_diagnostics.get(), m_early_disable_module_spoof.get(),
+                 m_early_disable_hooks.get(), m_early_disable_exception_handler.get(), m_early_disable_mods.get(),
+                 m_early_disable_faulty_file_detector.get()}) {
+            option->config_load(cfg);
+        }
+
+        diag_log(fmt::format("bisect config: DisableAll={} CrashReport={} ForceContinue={} ScannerCrasher={} CreateBLAS={} SusConstants={} PakIntegrity={} StackDestroyer={}",
+            m_disable_all_patches->value(), m_patch_crash_report_check->value(), m_crash_report_force_continue->value(),
+            m_patch_scanner_crasher->value(), m_hook_create_blas->value(), m_patch_sus_constants->value(),
+            m_patch_pak_integrity->value(), m_patch_stack_destroyer->value()));
+
+        // The loose-file loaders install their early hooks at REFramework.cpp:490, before mod configs
+        // are loaded at :602 (Mods.cpp:100), so their own `Enabled` switches would otherwise always
+        // read the default. Their early hooks are what run immediately before the fabricated
+        // exception fires, so being able to turn them off is the point.
+        // The loose-file loaders install their early hooks at REFramework.cpp:490, before mod configs
+    // are loaded at :602 (Mods.cpp:100), so their own `Enabled` switches would otherwise always read
+    // the default. Their early hooks are what run immediately before the fabricated exception fires,
+    // so being able to turn them off is the point. Also covers the IntegrityCheckBypass_* toggles,
+    // which the patches below read long before the mod config load.
+    LooseTextureLoader::get().on_config_load(cfg);
+        LooseFileLoader::get()->on_config_load(cfg);
+
+        diag_log(fmt::format("loaders: LooseTextureLoader={} LooseFileLoader={}", LooseTextureLoader::get().is_enabled(),
+            LooseFileLoader::get()->is_enabled()));
+    } catch (...) {
+        diag_log("bisect config: unreadable, using defaults");
+    }
+}
+
 // Everything here has to run before the game touches the trampolines and before the frame at
 // 0x1850C3D8 is built: `window at arm time` proved that frame is already fully populated by the time
 // remove_stack_destroyer() runs, so anything installed there only observes the aftermath.
@@ -3510,6 +3759,16 @@ void IntegrityCheckBypass::early_mhwilds_diagnostics() {
     diag_log("early phase: entered");
     early_log_open();
     diag_log("early phase: raw early log opened");
+
+    // Authoritative read-back of the group switches: the confirmed state, not what the file was
+    // meant to say. DllMain's own logging cannot be seen (the file sink does not exist yet), so this
+    // is the first point at which the resolved values can be recorded.
+    diag_log(fmt::format("early switches in effect: diagnostics_off={} module_spoof_off={} hooks_off={} exception_handler_off={} mods_off={}",
+        diagnostics_disabled(), module_spoof_disabled(), hooks_disabled(), exception_handler_disabled(), mods_disabled()));
+
+    // Moved to load_early_switches()/load_bisect_config() in DllMain: by the time this runs the
+    // patches below have already read the toggles, so loading them here was both too late and only
+    // reachable when diagnostics were on.
 
     try {
         if (!sdk::GameIdentity::get().is_mhwilds()) {
@@ -3530,6 +3789,9 @@ void IntegrityCheckBypass::early_mhwilds_diagnostics() {
         // single-step terminates the process before the log file exists.
         diag_log("early phase: installing first-chance vectored handler");
         init_first_chance_exception_logger();
+
+        diag_log("early phase: installing UnhandledExceptionFilter watcher");
+        init_unhandled_exception_filter_watcher();
 
         diag_log("early phase: neutralising trampolines");
         neutralize_stack_destroyer_trampolines(game);
@@ -3579,6 +3841,11 @@ void IntegrityCheckBypass::remove_stack_destroyer() {
         spdlog::info("[IntegrityCheckBypass]: "
                      "Found legacy stack destroyer at RVA 0x{:X}",
             *legacy - module_base);
+
+        if (m_disable_all_patches->value() || !m_patch_stack_destroyer->value()) {
+            spdlog::warn("[IntegrityCheckBypass]: Legacy stack destroyer patch SKIPPED (config).");
+            return;
+        }
 
         static auto patch = Patch::create(*legacy, {0xC3}, true);
 
@@ -3658,6 +3925,10 @@ void IntegrityCheckBypass::remove_stack_destroyer() {
 }
 
 void IntegrityCheckBypass::setup_pristine_syscall() {
+    if (hooks_disabled()) {
+        return;
+    }
+
     if (s_pristine_protect_virtual_memory != nullptr) {
         spdlog::info("[IntegrityCheckBypass]: NtProtectVirtualMemory already setup!");
         return;
@@ -3705,6 +3976,10 @@ void IntegrityCheckBypass::setup_pristine_syscall() {
 
 // hahahah i hate this
 void IntegrityCheckBypass::fix_virtual_protect() try {
+    if (hooks_disabled()) {
+        return;
+    }
+
     spdlog::info("[IntegrityCheckBypass]: Fixing VirtualProtect...");
 
     setup_pristine_syscall(); // Called earlier in DllMain
@@ -3810,7 +4085,7 @@ BOOL WINAPI IntegrityCheckBypass::virtual_protect_hook(LPVOID lpAddress, SIZE_T 
 }
 
 void IntegrityCheckBypass::hook_add_vectored_exception_handler() {
-    if (sdk::GameIdentity::get().tdb_ver() < 73) return;
+    if (hooks_disabled() || sdk::GameIdentity::get().tdb_ver() < 73) return;
     spdlog::info("[IntegrityCheckBypass]: Hooking AddVectoredExceptionHandler...");
 
     s_add_vectored_exception_handler_hook = std::make_unique<FunctionHookMinHook>(AddVectoredExceptionHandler, (uintptr_t)add_vectored_exception_handler_hook);
@@ -3870,6 +4145,10 @@ PVOID WINAPI IntegrityCheckBypass::add_vectored_exception_handler_hook(ULONG Fir
 }
 
 void IntegrityCheckBypass::hook_rtl_exit_user_process() {
+    if (hooks_disabled()) {
+        return;
+    }
+
     spdlog::info("[IntegrityCheckBypass]: Hooking RtlExitUserProcess...");
 
     const auto ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -4170,6 +4449,19 @@ void IntegrityCheckBypass::on_config_load(const utility::Config& cfg) {
     for (IModValue& option : m_options) {
         option.config_load(cfg);
     }
+
+    // Read-back through the normal log sink, so the patch state is verifiable in any run -- including
+    // runs with diagnostics off, where the early log is never opened.
+    spdlog::info("[IntegrityCheckBypass]: patches in effect: DisableAll={} CrashReport={} ForceContinue={} ScannerCrasher={} CreateBLAS={} SusConstants={} PakIntegrity={} StackDestroyer={}",
+        m_disable_all_patches->value(), m_patch_crash_report_check->value(), m_crash_report_force_continue->value(),
+        m_patch_scanner_crasher->value(), m_hook_create_blas->value(), m_patch_sus_constants->value(),
+        m_patch_pak_integrity->value(), m_patch_stack_destroyer->value());
+
+    // The group switches are latched in DllMain, so report the latched values (the accessors), not
+    // the raw options -- this is what is actually in effect for this run.
+    spdlog::info("[IntegrityCheckBypass]: groups in effect: minimal={} diagnostics_off={} module_spoof_off={} hooks_off={} exception_handler_off={} mods_off={} faulty_file_detector_off={}",
+        m_early_minimal->value(), diagnostics_disabled(), module_spoof_disabled(), hooks_disabled(),
+        exception_handler_disabled(), mods_disabled(), faulty_file_detector_disabled());
 }
 
 void IntegrityCheckBypass::on_config_save(utility::Config& cfg) {

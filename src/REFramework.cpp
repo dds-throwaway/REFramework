@@ -240,7 +240,8 @@ try {
             if (full_dll_path.parent_path() == *g_current_game_path) {
                 spdlog::info("LdrRegisterDllNotification: DLL loaded from game directory: {}", utility::narrow(full_dll_name));
 
-                if (sdk::GameIdentity::get().is_dd2() || sdk::GameIdentity::get().is_mhrise() || sdk::GameIdentity::get().tdb_ver() >= 74) {
+                if ((sdk::GameIdentity::get().is_dd2() || sdk::GameIdentity::get().is_mhrise() || sdk::GameIdentity::get().tdb_ver() >= 74) &&
+                    !IntegrityCheckBypass::module_spoof_disabled()) {
                     utility::spoof_module_paths_in_exe_dir();
                 }
             }
@@ -353,7 +354,7 @@ REFramework::REFramework(HMODULE reframework_module)
         }
 
         // Do this at least once before setting up our callback.
-        if (gi.is_dd2() || gi.is_mhrise() || gi.tdb_ver() >= 74) {
+        if ((gi.is_dd2() || gi.is_mhrise() || gi.tdb_ver() >= 74) && !IntegrityCheckBypass::module_spoof_disabled()) {
             // Pre-emptively copy all DLL files in the current game directory into our _storage_ directory.
             if (g_current_game_path.has_value()) {
                 const auto dest_path = *g_current_game_path / "_storage_";
@@ -435,7 +436,7 @@ REFramework::REFramework(HMODULE reframework_module)
         spdlog::info("Registering LdrRegisterDllNotification callback...");
         const auto ldr_register_dll_notification = (LdrRegisterDllNotification_t)GetProcAddress(ntdll, "LdrRegisterDllNotification");
 
-        if (ldr_register_dll_notification != nullptr) {
+        if (ldr_register_dll_notification != nullptr && !IntegrityCheckBypass::module_spoof_disabled()) {
             PVOID cookie = nullptr;
             g_success_made_ldr_notification = NT_SUCCESS(ldr_register_dll_notification(0, ldr_notification_callback, nullptr, &cookie));
 
@@ -482,14 +483,14 @@ REFramework::REFramework(HMODULE reframework_module)
         LoadLibraryA("dxgi.dll");
         LoadLibraryA("d3d11.dll");
 
-        if (!g_success_made_ldr_notification) {
+        if (!g_success_made_ldr_notification && !IntegrityCheckBypass::module_spoof_disabled()) {
             utility::spoof_module_paths_in_exe_dir();
         }
     }
 
-    LooseTextureLoader::get().early_initialize();
+    if (!IntegrityCheckBypass::mods_disabled()) LooseTextureLoader::get().early_initialize();
 
-    if (gi.tdb_ver() >= 81) {
+    if (gi.tdb_ver() >= 81 && !IntegrityCheckBypass::mods_disabled() && !IntegrityCheckBypass::faulty_file_detector_disabled()) {
         FaultyFileDetector::early_init();
     }
 
@@ -602,7 +603,7 @@ REFramework::REFramework(HMODULE reframework_module)
             integrity_bypass->on_config_load(cfg);
         }
 
-        if (loader->is_enabled()) {
+        if (loader->is_enabled() && !IntegrityCheckBypass::mods_disabled()) {
             loader->hook();
         }
     }
@@ -2165,7 +2166,7 @@ bool REFramework::initialize() {
         return true;
     }
 
-    reframework::setup_exception_handler();
+    if (!IntegrityCheckBypass::exception_handler_disabled()) reframework::setup_exception_handler();
 
     if (m_first_initialize) {
         m_frames_since_init = 0;
@@ -2391,7 +2392,8 @@ bool REFramework::initialize_game_data() {
 
             m_mods = std::make_unique<Mods>();
 
-            auto e = m_mods->on_initialize();
+            auto e = IntegrityCheckBypass::mods_disabled() ? std::optional<std::string>{}
+                                                          : m_mods->on_initialize();
 
             if (e) {
                 if (e->empty()) {

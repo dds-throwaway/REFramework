@@ -126,6 +126,16 @@ void LooseTextureLoader::early_initialize() {
     if (sdk::GameIdentity::get().tdb_ver() < 81) {
         return;
     }
+
+    // Own `Enabled` switch, honoured here rather than only at frame time: these hooks are installed
+    // at REFramework.cpp:490, before REFramework loads mod configs at :602, so early_initialize()
+    // would otherwise always run. IntegrityCheckBypass reads LooseTextureLoader_Enabled from the
+    // config file during its early phase precisely so this check sees the user's value.
+    if (!is_enabled()) {
+        spdlog::info("[LooseTextureLoader]: Disabled, skipping early hooks.");
+        return;
+    }
+
     hook_dstorage_path_checks();
     hook_dstorage_enqueue_chain();
     hook_resource_path_hashing();
