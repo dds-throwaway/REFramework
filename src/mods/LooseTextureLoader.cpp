@@ -1,6 +1,8 @@
 ﻿#include <algorithm>
 #include <array>
+#include <intrin.h>
 #include <optional>
+#include <utility>
 
 #include <spdlog/spdlog.h>
 #include <bddisasm.h>
@@ -25,10 +27,6 @@ void LooseTextureLoader::handle_prepare_enqueue_texture_upload_wrapper(safetyhoo
 
 void LooseTextureLoader::handle_start_enqueue_texture_upload_wrapper(safetyhook::Context& context) {
     get().handle_start_enqueue_texture_upload(context);
-}
-
-void LooseTextureLoader::handle_path_check_to_open_dstorage_file_wrapper(safetyhook::Context& context) {
-    get().handle_path_check_to_open_dstorage_file(context);
 }
 
 void LooseTextureLoader::handle_resource_hash_path_wrapper(safetyhook::Context& context) {
@@ -62,6 +60,11 @@ void LooseTextureLoader::on_draw_ui() {
 #if !ENABLE_LOOSE_TEXTURE_LOADER
     return;
 #else
+    // Part of the LooseFileLoader menu: draw nothing while the disable switch is set.
+    if (LooseFileLoader::loose_files_disabled()) {
+        return;
+    }
+
     if (sdk::GameIdentity::get().tdb_ver() < 81) {
         return;
     }
@@ -120,12 +123,49 @@ void LooseTextureLoader::on_draw_ui() {
 #endif
 }
 
+// Decode the call at `call_addr`, returning (target, return address). Handles the two encodings a CRT
+// import call uses: `call rel32` (0xE8) and `call qword ptr [rip+rel32]` (0xFF 0x15). For the indirect
+// form the target is read through the slot, which is the resolved function the game actually calls -
+// that is what gets hooked, instead of the call site itself.
+static std::optional<std::pair<uintptr_t, uintptr_t>> decode_call(uintptr_t call_addr) {
+    const auto opcode = *reinterpret_cast<const uint8_t*>(call_addr);
+
+    if (opcode == 0xE8) {
+        const auto rel = *reinterpret_cast<const int32_t*>(call_addr + 1);
+        return std::make_pair(static_cast<uintptr_t>(call_addr + 5 + rel), call_addr + 5);
+    }
+
+    if (opcode == 0xFF) {
+        const auto modrm = *reinterpret_cast<const uint8_t*>(call_addr + 1);
+
+        if (modrm == 0x15) {
+            const auto rel = *reinterpret_cast<const int32_t*>(call_addr + 2);
+            const auto slot = call_addr + 6 + rel;
+
+            if (IsBadReadPtr((const void*)slot, sizeof(uintptr_t))) {
+                return std::nullopt;
+            }
+
+            return std::make_pair(*reinterpret_cast<uintptr_t*>(slot), call_addr + 6);
+        }
+    }
+
+    return std::nullopt;
+}
+
 void LooseTextureLoader::early_initialize() {
 #if ENABLE_LOOSE_TEXTURE_LOADER
     // Only TDB>=81 games (MHWILDS+) have the DStorage-based loose texture path.
     if (sdk::GameIdentity::get().tdb_ver() < 81) {
         return;
     }
+    // Same switch as LooseFileLoader: when it is set, no loose loading happens at all - these hooks are
+    // the texture half of it, so skip them too.
+    if (LooseFileLoader::loose_files_disabled()) {
+        spdlog::info("[LooseTextureLoader]: REF_DISABLE_LOOSE_TEXTURES is set - skipping all loose texture hooks.");
+        return;
+    }
+
     hook_dstorage_path_checks();
     hook_dstorage_enqueue_chain();
     hook_resource_path_hashing();
@@ -163,7 +203,12 @@ void LooseTextureLoader::hook_dstorage_path_checks() {
         return;
     }
 
-    // For each reference, scan until hitting a call instruction (wcsstr)
+    // The original code patched these wcsstr call sites directly. That modifies game code, and
+    // MHWilds' integrity scanner detects it: the process is force-terminated during startup. The call
+    // sites are therefore only *recorded* now, and wcsstr itself is hooked instead (see wcsstr_hook),
+    // so nothing in the game's code changes.
+    uintptr_t wcsstr_addr = 0;
+
     for (auto ref : fnc_refs) {
         uintptr_t wcsstr_call_addr = 0;
 
@@ -179,13 +224,41 @@ void LooseTextureLoader::hook_dstorage_path_checks() {
             continue;
         }
 
-        auto hook = safetyhook::create_mid((void*)wcsstr_call_addr, &LooseTextureLoader::handle_path_check_to_open_dstorage_file_wrapper);
-        if (hook) {
-            spdlog::info("[LooseTextureLoader]: Hooked wcsstr call at 0x{:X} for DStorage .tex bypass", wcsstr_call_addr);
-        } else {
-            spdlog::error("[LooseTextureLoader]: Failed to hook wcsstr call at 0x{:X}!", wcsstr_call_addr);
+        const auto call = decode_call(wcsstr_call_addr);
+
+        if (!call) {
+            spdlog::warn("[LooseTextureLoader]: Could not decode the call at 0x{:X}, skipping", wcsstr_call_addr);
+            continue;
         }
-        m_path_check_dstorage_hooks.push_back(std::move(hook));
+
+        if (wcsstr_addr == 0) {
+            wcsstr_addr = call->first;
+        } else if (wcsstr_addr != call->first) {
+            spdlog::warn("[LooseTextureLoader]: DStorage path-check call sites target different functions "
+                         "(0x{:X} vs 0x{:X}); hooking the first", wcsstr_addr, call->first);
+        }
+
+        s_path_check_return_addrs.push_back(call->second);
+        spdlog::info("[LooseTextureLoader]: DStorage .tex bypass call site at 0x{:X} (calls 0x{:X}, returns to 0x{:X})",
+            wcsstr_call_addr, call->first, call->second);
+    }
+
+    if (wcsstr_addr == 0 || s_path_check_return_addrs.empty()) {
+        spdlog::error("[LooseTextureLoader]: Could not resolve the DStorage path-check call sites");
+        return;
+    }
+
+    if (s_wcsstr_hook) {
+        return;
+    }
+
+    s_wcsstr_hook = std::make_unique<FunctionHook>(wcsstr_addr, &LooseTextureLoader::wcsstr_hook);
+
+    if (!s_wcsstr_hook->create()) {
+        spdlog::error("[LooseTextureLoader]: Failed to hook wcsstr at 0x{:X}!", wcsstr_addr);
+        s_wcsstr_hook.reset();
+    } else {
+        spdlog::info("[LooseTextureLoader]: Hooked wcsstr at 0x{:X} for DStorage .tex bypass (no game code patched)", wcsstr_addr);
     }
 }
 
@@ -599,17 +672,38 @@ std::optional<uintptr_t> LooseTextureLoader::find_direct_storage_file_open_funct
     return func_start;
 }
 
-void LooseTextureLoader::handle_path_check_to_open_dstorage_file(safetyhook::Context& context) {
-    if (!m_enabled->value()) return;
+// The .tex override, moved off the call sites and into wcsstr itself. Only calls that came from the
+// scanned DStorage path-check sites are affected, so every other wcsstr caller in the process keeps
+// stock behaviour. Nothing in the game's code is written - which is the point: patching game code is
+// what MHWilds' integrity scanner reacts to (it force-terminates the process during startup).
+const wchar_t* __cdecl LooseTextureLoader::wcsstr_hook(const wchar_t* haystack, const wchar_t* needle) {
+    static const auto original = s_wcsstr_hook->get_original<decltype(wcsstr_hook)>();
 
-    wchar_t *target_path = (wchar_t*)context.rcx;
-    wchar_t *search_str = (wchar_t*)context.rdx;
-    
-    // Search if our path contains .tex extension, if yes, replace rdx with ".tex" to make wcsstr return true
-    if (target_path && search_str && wcsstr(target_path, TEX_FILE_EXTENSION) != nullptr) {
-        //spdlog::info("[LooseTextureLoader]: Detected loose .tex file, patching to bypass it! Path: {}", utility::narrow(target_path));
-        context.rdx = (uint64_t)TEX_FILE_EXTENSION;
+    if (!get().m_enabled->value()) {
+        return original(haystack, needle);
     }
+
+    bool from_path_check = false;
+    const auto ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
+
+    for (const auto expected : s_path_check_return_addrs) {
+        if (ret == expected) {
+            from_path_check = true;
+            break;
+        }
+    }
+
+    if (!from_path_check) {
+        return original(haystack, needle);
+    }
+
+    // The game is asking whether a resource path lives inside the base pak. A loose .tex file does not,
+    // so answer as if the path contained ".tex" instead, which is what lets the loose file load.
+    if (haystack != nullptr && original(haystack, TEX_FILE_EXTENSION) != nullptr) {
+        return original(haystack, TEX_FILE_EXTENSION);
+    }
+
+    return original(haystack, needle);
 }
 
 REPakEntryData* LooseTextureLoader::borrow_pak_entry_data(uintptr_t dstorage_file_ptr) {

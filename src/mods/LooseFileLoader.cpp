@@ -38,7 +38,7 @@ std::optional<std::string> LooseFileLoader::on_initialize() {
 }
 
 void LooseFileLoader::on_frame() {
-    if (!m_attempted_hook && m_enabled->value()) {
+    if (!m_attempted_hook && is_enabled()) {
         hook();
     }
 }
@@ -64,6 +64,12 @@ void LooseFileLoader::on_config_save(utility::Config& cfg) {
 }
 
 void LooseFileLoader::on_draw_ui() {
+    // The mod is inert while the switch is set, so there is nothing to show or change: don't draw its
+    // menu at all (the config checkbox would otherwise still invite you to enable a disabled feature).
+    if (loose_files_disabled()) {
+        return;
+    }
+
     if (!ImGui::CollapsingHeader(get_name().data())) {
         return;
     }
@@ -153,8 +159,25 @@ void LooseFileLoader::on_draw_ui() {
     m_texture_loader.on_draw_ui();
 }
 
+// To ensure no loose textures are loaded through loose file paths, disabling
+// loose textures disables loose files altogether. This is intentional to avoid
+// missing textures/models/etc which may cause hangs.
+bool LooseFileLoader::loose_files_disabled() {
+    char value[8]{};
+    const auto length = GetEnvironmentVariableA("REF_DISABLE_LOOSE_TEXTURES", value, sizeof(value));
+
+    // Treat any value defined for the ENV VAR as a flag to disable. Do not attempt to read the value.
+    return length != 0;
+}
+
 void LooseFileLoader::hook() {
     if (m_attempted_hook) {
+        return;
+    }
+
+    if (loose_files_disabled()) {
+        m_attempted_hook = true;
+        spdlog::info("[LooseFileLoader]: REF_DISABLE_LOOSE_TEXTURES is set - not hooking path_to_hash (loose loading fully disabled).");
         return;
     }
 
@@ -351,6 +374,11 @@ bool LooseFileLoader::handle_path(const wchar_t* path, size_t hash) {
         return false;
     }
 
+    // Likely unnecessary guard, never report a file as loosely loaded.
+    if (loose_files_disabled()) {
+        return false;
+    }
+
     ++m_files_encountered;
 
     if (m_show_recent_files) {
@@ -365,7 +393,7 @@ bool LooseFileLoader::handle_path(const wchar_t* path, size_t hash) {
         }
     }
 
-    const auto enabled = m_enabled->value();
+    const auto enabled = is_enabled();
 
     //spdlog::info("[LooseFileLoader] path_to_hash_hook called with path: {}", utility::narrow(path));
 
@@ -458,7 +486,7 @@ uint64_t LooseFileLoader::path_to_hash_hook_legacy(void* This, const wchar_t* pa
 }
 
 bool LooseFileLoader::can_loosely_load_file(const wchar_t* path) {
-    if (!m_enabled->value()) {
+    if (!is_enabled()) {
         return false;
     }
 
