@@ -136,10 +136,13 @@ void LooseTextureLoader::early_initialize() {
         return;
     }
 
-    hook_dstorage_path_checks();
-    hook_dstorage_enqueue_chain();
-    hook_resource_path_hashing();
-    find_get_path_to_resource_func();
+    // Each step is switchable so the one the anti-tamper reacts to can be isolated. Braceless
+    // one-liners on purpose: wrapping these four calls in blocks would re-indent existing lines and
+    // churn the diff.
+    if (m_hook_path_checks->value()) hook_dstorage_path_checks();
+    if (m_hook_enqueue_chain->value()) hook_dstorage_enqueue_chain();
+    if (m_hook_resource_path_hashing->value()) hook_resource_path_hashing();
+    if (m_find_get_path_to_resource->value()) find_get_path_to_resource_func();
 #endif
 }
 
