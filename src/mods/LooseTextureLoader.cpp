@@ -60,6 +60,11 @@ void LooseTextureLoader::on_draw_ui() {
 #if !ENABLE_LOOSE_TEXTURE_LOADER
     return;
 #else
+    // Part of the LooseFileLoader menu: draw nothing while the disable switch is set.
+    if (LooseFileLoader::loose_files_disabled()) {
+        return;
+    }
+
     if (sdk::GameIdentity::get().tdb_ver() < 81) {
         return;
     }
@@ -118,18 +123,6 @@ void LooseTextureLoader::on_draw_ui() {
 #endif
 }
 
-// Escape hatch for testing: with REF_DISABLE_LOOSE_TEXTURES set (1/true/yes) every loose-texture hook
-// is skipped, so the game boots with no texture support at all.
-static bool loose_textures_disabled() {
-    char value[8]{};
-
-    if (GetEnvironmentVariableA("REF_DISABLE_LOOSE_TEXTURES", value, sizeof(value)) == 0) {
-        return false;
-    }
-
-    return value[0] == '1' || value[0] == 't' || value[0] == 'T' || value[0] == 'y' || value[0] == 'Y';
-}
-
 // Decode the call at `call_addr`, returning (target, return address). Handles the two encodings a CRT
 // import call uses: `call rel32` (0xE8) and `call qword ptr [rip+rel32]` (0xFF 0x15). For the indirect
 // form the target is read through the slot, which is the resolved function the game actually calls -
@@ -166,9 +159,10 @@ void LooseTextureLoader::early_initialize() {
     if (sdk::GameIdentity::get().tdb_ver() < 81) {
         return;
     }
-    // Escape hatch for testing: skip every loose-texture hook so the game boots with no texture support.
-    if (loose_textures_disabled()) {
-        spdlog::info("[LooseTextureLoader]: REF_DISABLE_LOOSE_TEXTURES is set - all loose texture hooks skipped.");
+    // Same switch as LooseFileLoader: when it is set, no loose loading happens at all - these hooks are
+    // the texture half of it, so skip them too.
+    if (LooseFileLoader::loose_files_disabled()) {
+        spdlog::info("[LooseTextureLoader]: REF_DISABLE_LOOSE_TEXTURES is set - skipping all loose texture hooks.");
         return;
     }
 

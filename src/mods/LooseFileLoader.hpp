@@ -28,8 +28,15 @@ public:
     void hook();
     void early_initialize();
 
+    // True when REF_DISABLE_LOOSE_TEXTURES is set: every loose-loading hook is skipped, so the game runs
+    // with no loose files at all (textures, models, animations) rather than a half-disabled state where
+    // loose models are still substituted for the pak and come out broken.
+    static bool loose_files_disabled();
+
+    // The environment switch is folded in here, so every check that already consults is_enabled() behaves
+    // exactly as if LooseFileLoader_Enabled=false had been set - no separate code paths to keep in sync.
     bool is_enabled() const {
-        return m_enabled->value();
+        return !loose_files_disabled() && m_enabled->value();
     }
 
     bool can_loosely_load_file(const wchar_t* path);
