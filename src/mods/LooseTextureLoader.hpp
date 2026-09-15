@@ -12,6 +12,7 @@
 
 #include "Mod.hpp"
 #include "sdk/ReClass_LooseTextureLoader_Internal.hpp"
+#include "utility/FunctionHook.hpp"
 
 #include <safetyhook.hpp>
 
@@ -96,7 +97,9 @@ private:
 
 private:
     // Hooks
-    static inline safetyhook::InlineHook s_wcsstr_hook{};
+    // wcsstr is hooked through FunctionHook (safetyhook under the hood), which is what exposes the
+    // trampoline needed to call the original.
+    static inline std::unique_ptr<FunctionHook> s_wcsstr_hook{};
     // Return addresses of the scanned DStorage path-check call sites; used to recognise the callers
     // that the .tex override applies to.
     static inline std::vector<uintptr_t> s_path_check_return_addrs{};

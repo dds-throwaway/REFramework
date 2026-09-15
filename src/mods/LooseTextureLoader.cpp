@@ -258,12 +258,13 @@ void LooseTextureLoader::hook_dstorage_path_checks() {
         return;
     }
 
-    s_wcsstr_hook = safetyhook::create_inline((void*)wcsstr_addr, &LooseTextureLoader::wcsstr_hook);
+    s_wcsstr_hook = std::make_unique<FunctionHook>(wcsstr_addr, &LooseTextureLoader::wcsstr_hook);
 
-    if (s_wcsstr_hook) {
-        spdlog::info("[LooseTextureLoader]: Hooked wcsstr at 0x{:X} for DStorage .tex bypass (no game code patched)", wcsstr_addr);
-    } else {
+    if (!s_wcsstr_hook->create()) {
         spdlog::error("[LooseTextureLoader]: Failed to hook wcsstr at 0x{:X}!", wcsstr_addr);
+        s_wcsstr_hook.reset();
+    } else {
+        spdlog::info("[LooseTextureLoader]: Hooked wcsstr at 0x{:X} for DStorage .tex bypass (no game code patched)", wcsstr_addr);
     }
 }
 
@@ -682,7 +683,7 @@ std::optional<uintptr_t> LooseTextureLoader::find_direct_storage_file_open_funct
 // stock behaviour. Nothing in the game's code is written - which is the point: patching game code is
 // what MHWilds' integrity scanner reacts to (it force-terminates the process during startup).
 const wchar_t* __cdecl LooseTextureLoader::wcsstr_hook(const wchar_t* haystack, const wchar_t* needle) {
-    static const auto original = s_wcsstr_hook.get_original<decltype(wcsstr_hook)>();
+    static const auto original = s_wcsstr_hook->get_original<decltype(wcsstr_hook)>();
 
     if (!get().m_enabled->value()) {
         return original(haystack, needle);
