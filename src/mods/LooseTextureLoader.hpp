@@ -79,7 +79,6 @@ private:
     void find_get_path_to_resource_func();
 
     std::optional<uintptr_t> find_direct_storage_file_open_function();
-    void handle_path_check_to_open_dstorage_file(safetyhook::Context& context);
     void handle_prepare_enqueue_texture_upload(safetyhook::Context& context);
     void handle_start_enqueue_texture_upload(safetyhook::Context& context);
     REPakEntryData* borrow_pak_entry_data(uintptr_t dstorage_file_ptr);
@@ -87,14 +86,20 @@ private:
     void handle_resource_hash_path(safetyhook::Context& context);
 
     // Static wrappers for safetyhook callbacks (must be plain function pointers)
-    static void handle_path_check_to_open_dstorage_file_wrapper(safetyhook::Context& context);
+    // wcsstr is hooked instead of its call sites: patching game code is what MHWilds' integrity
+    // scanner reacts to, so the override is applied from inside wcsstr and only for the callers that
+    // were found by the DStorage path-check scan.
+    static const wchar_t* __cdecl wcsstr_hook(const wchar_t* haystack, const wchar_t* needle);
     static void handle_prepare_enqueue_texture_upload_wrapper(safetyhook::Context& context);
     static void handle_start_enqueue_texture_upload_wrapper(safetyhook::Context& context);
     static void handle_resource_hash_path_wrapper(safetyhook::Context& context);
 
 private:
     // Hooks
-    std::vector<safetyhook::MidHook> m_path_check_dstorage_hooks{};
+    static inline safetyhook::InlineHook s_wcsstr_hook{};
+    // Return addresses of the scanned DStorage path-check call sites; used to recognise the callers
+    // that the .tex override applies to.
+    static inline std::vector<uintptr_t> s_path_check_return_addrs{};
     safetyhook::MidHook m_prepare_enqueue_texture_upload_hook{};
     safetyhook::MidHook m_start_enqueue_texture_upload_hook{};
     safetyhook::MidHook m_resource_hash_path_hook{};
