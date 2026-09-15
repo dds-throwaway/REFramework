@@ -1,6 +1,8 @@
 ﻿#include <algorithm>
 #include <array>
+#include <intrin.h>
 #include <optional>
+#include <utility>
 
 #include <spdlog/spdlog.h>
 #include <bddisasm.h>
@@ -25,14 +27,6 @@ void LooseTextureLoader::handle_prepare_enqueue_texture_upload_wrapper(safetyhoo
 
 void LooseTextureLoader::handle_start_enqueue_texture_upload_wrapper(safetyhook::Context& context) {
     get().handle_start_enqueue_texture_upload(context);
-}
-
-void LooseTextureLoader::handle_path_check_to_open_dstorage_file_wrapper(safetyhook::Context& context) {
-    get().handle_path_check_to_open_dstorage_file(context);
-}
-
-void LooseTextureLoader::handle_resource_hash_path_wrapper(safetyhook::Context& context) {
-    get().handle_resource_hash_path(context);
 }
 
 // Single-ref variant: find the function that references `ptr` via displacement.
@@ -120,6 +114,27 @@ void LooseTextureLoader::on_draw_ui() {
 #endif
 }
 
+// Resolve the IAT slot behind a call to the imported wcsstr. A `call rel32` lands on the game's import
+// thunk (`jmp qword ptr [slot]`); an indirect call names the slot itself.
+static std::optional<uintptr_t> resolve_import_slot(uintptr_t call_addr) {
+    const auto opcode = *reinterpret_cast<const uint8_t*>(call_addr);
+
+    if (opcode == 0xFF && *reinterpret_cast<const uint8_t*>(call_addr + 1) == 0x15) {
+        return call_addr + 6 + *reinterpret_cast<const int32_t*>(call_addr + 2);
+    }
+
+    if (opcode == 0xE8) {
+        const auto target = call_addr + 5 + *reinterpret_cast<const int32_t*>(call_addr + 1);
+
+        if (*reinterpret_cast<const uint8_t*>(target) == 0xFF
+            && *reinterpret_cast<const uint8_t*>(target + 1) == 0x25) {
+            return target + 6 + *reinterpret_cast<const int32_t*>(target + 2);
+        }
+    }
+
+    return std::nullopt;
+}
+
 void LooseTextureLoader::early_initialize() {
 #if ENABLE_LOOSE_TEXTURE_LOADER
     // Only TDB>=81 games (MHWILDS+) have the DStorage-based loose texture path.
@@ -163,7 +178,8 @@ void LooseTextureLoader::hook_dstorage_path_checks() {
         return;
     }
 
-    // For each reference, scan until hitting a call instruction (wcsstr)
+    // Replace only the imported wcsstr's IAT slot
+    std::optional<uintptr_t> slot_addr{};
     for (auto ref : fnc_refs) {
         uintptr_t wcsstr_call_addr = 0;
 
@@ -179,14 +195,39 @@ void LooseTextureLoader::hook_dstorage_path_checks() {
             continue;
         }
 
-        auto hook = safetyhook::create_mid((void*)wcsstr_call_addr, &LooseTextureLoader::handle_path_check_to_open_dstorage_file_wrapper);
-        if (hook) {
-            spdlog::info("[LooseTextureLoader]: Hooked wcsstr call at 0x{:X} for DStorage .tex bypass", wcsstr_call_addr);
-        } else {
-            spdlog::error("[LooseTextureLoader]: Failed to hook wcsstr call at 0x{:X}!", wcsstr_call_addr);
+        slot_addr = resolve_import_slot(wcsstr_call_addr);
+
+        if (slot_addr) {
+            spdlog::info("[LooseTextureLoader]: wcsstr call at 0x{:X} goes through IAT slot 0x{:X}", wcsstr_call_addr, *slot_addr);
+            break;
         }
-        m_path_check_dstorage_hooks.push_back(std::move(hook));
     }
+
+    if (!slot_addr) {
+        spdlog::error("[LooseTextureLoader]: Could not resolve the wcsstr IAT slot");
+        return;
+    }
+
+    if (s_wcsstr_slot != nullptr) {
+        return;
+    }
+
+    auto* const slot = reinterpret_cast<void**>(*slot_addr);
+    DWORD old_protect{};
+
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old_protect)) {
+        spdlog::error("[LooseTextureLoader]: Could not make the wcsstr IAT slot at 0x{:X} writable", *slot_addr);
+        return;
+    }
+
+    s_wcsstr_original = reinterpret_cast<decltype(s_wcsstr_original)>(*slot);
+    s_wcsstr_slot = slot;
+    *slot = reinterpret_cast<void*>(&LooseTextureLoader::wcsstr_hook);
+
+    VirtualProtect(slot, sizeof(void*), old_protect, &old_protect);
+
+    spdlog::info("[LooseTextureLoader]: Replaced wcsstr IAT slot 0x{:X} (was 0x{:X})",
+        *slot_addr, reinterpret_cast<uintptr_t>(s_wcsstr_original));
 }
 
 void LooseTextureLoader::hook_dstorage_enqueue_chain() {
@@ -302,6 +343,7 @@ void LooseTextureLoader::hook_resource_path_hashing() {
 
     // For each call target, check if it contains xxhash constants
     uintptr_t hash_call_addr = 0;
+    uintptr_t hash_target_addr = 0;
 
     for (const auto& site : call_sites) {
         bool found_constant = false;
@@ -324,6 +366,7 @@ void LooseTextureLoader::hook_resource_path_hashing() {
 
         if (found_constant) {
             hash_call_addr = site.call_addr;
+            hash_target_addr = site.target_addr;
             spdlog::info("[LooseTextureLoader]: Found resource path hash call at 0x{:X} -> target 0x{:X}", site.call_addr, site.target_addr);
             break;
         }
@@ -334,11 +377,16 @@ void LooseTextureLoader::hook_resource_path_hashing() {
         return;
     }
 
-    m_resource_hash_path_hook = safetyhook::create_mid((void*)hash_call_addr, &LooseTextureLoader::handle_resource_hash_path_wrapper);
-    if (m_resource_hash_path_hook) {
-        spdlog::info("[LooseTextureLoader]: Hooked resource path hashing at 0x{:X}", hash_call_addr);
+    // Hook the callee, not the call site, so the caller's body is untouched.
+    s_hash_call_site = hash_call_addr + 5; // CALLNR is a 5-byte call, so +5 is the caller's return address
+    m_resource_hash_path_hook = std::make_unique<FunctionHook>(hash_target_addr, (uintptr_t)&LooseTextureLoader::hash_function_hook);
+
+    if (!m_resource_hash_path_hook->create()) {
+        spdlog::error("[LooseTextureLoader]: Failed to hook resource path hashing at 0x{:X} (target 0x{:X})!", hash_call_addr, hash_target_addr);
+        m_resource_hash_path_hook.reset();
     } else {
-        spdlog::error("[LooseTextureLoader]: Failed to hook resource path hashing at 0x{:X}!", hash_call_addr);
+        spdlog::info("[LooseTextureLoader]: Hooked resource path hashing target 0x{:X} (call site 0x{:X}, gated to 0x{:X})",
+            hash_target_addr, hash_call_addr, s_hash_call_site);
     }
 }
 
@@ -599,17 +647,18 @@ std::optional<uintptr_t> LooseTextureLoader::find_direct_storage_file_open_funct
     return func_start;
 }
 
-void LooseTextureLoader::handle_path_check_to_open_dstorage_file(safetyhook::Context& context) {
-    if (!m_enabled->value()) return;
-
-    wchar_t *target_path = (wchar_t*)context.rcx;
-    wchar_t *search_str = (wchar_t*)context.rdx;
-    
-    // Search if our path contains .tex extension, if yes, replace rdx with ".tex" to make wcsstr return true
-    if (target_path && search_str && wcsstr(target_path, TEX_FILE_EXTENSION) != nullptr) {
-        //spdlog::info("[LooseTextureLoader]: Detected loose .tex file, patching to bypass it! Path: {}", utility::narrow(target_path));
-        context.rdx = (uint64_t)TEX_FILE_EXTENSION;
+const wchar_t* __cdecl LooseTextureLoader::wcsstr_hook(const wchar_t* str, const wchar_t* substr) {
+    if (!get().m_enabled->value()) {
+        return s_wcsstr_original(str, substr);
     }
+
+    // A loose .tex is not in the base pak, so answer as if the path contained ".tex" so it loads.
+    if (substr != nullptr && wcscmp(substr, PAK_PATTERN) == 0
+        && str != nullptr && s_wcsstr_original(str, TEX_FILE_EXTENSION) != nullptr) {
+        return s_wcsstr_original(str, TEX_FILE_EXTENSION);
+    }
+
+    return s_wcsstr_original(str, substr);
 }
 
 REPakEntryData* LooseTextureLoader::borrow_pak_entry_data(uintptr_t dstorage_file_ptr) {
@@ -700,23 +749,25 @@ void LooseTextureLoader::handle_start_enqueue_texture_upload(safetyhook::Context
     release_pak_entry_data(pak_entry_data);
 }
 
-void LooseTextureLoader::handle_resource_hash_path(safetyhook::Context& context) {
-    if (!m_enabled->value()) return;
+uint64_t LooseTextureLoader::hash_function_hook(const wchar_t* path, size_t size, uint64_t combine) {
+    const auto og = get().m_resource_hash_path_hook->get_original<decltype(hash_function_hook)>();
 
-    // rcx: path (wchar_t*)
-    // rdx: size of hash (bytes)
-    // r8: hash combine
-    // Hash function is xxhash
-    auto* path = reinterpret_cast<const wchar_t*>(context.rcx);
-    const auto size = static_cast<size_t>(context.rdx);
+    if (!get().m_enabled->value() || reinterpret_cast<uintptr_t>(_ReturnAddress()) != s_hash_call_site) {
+        return og(path, size, combine);
+    }
 
+    return get().handle_hash_function(og, path, size, combine);
+}
+
+// The callee's signature, taken from the call site's rcx/rdx/r8.
+uint64_t LooseTextureLoader::handle_hash_function(HashFunction original, const wchar_t* path, size_t size, uint64_t combine) {
     if (path == nullptr || size == 0) {
-        return;
+        return original(path, size, combine);
     }
 
     std::wstring_view path_view{path, size / sizeof(wchar_t)};
     if (path_view.empty()) {
-        return;
+        return original(path, size, combine);
     }
 
     ResourceType resource_type = ResourceType::None;
@@ -729,7 +780,7 @@ void LooseTextureLoader::handle_resource_hash_path(safetyhook::Context& context)
     }
 
     if (resource_type == ResourceType::None) {
-         return;
+         return original(path, size, combine);
     }
 
     bool localize = false;
@@ -766,7 +817,7 @@ void LooseTextureLoader::handle_resource_hash_path(safetyhook::Context& context)
 
     auto& loose_file_loader = LooseFileLoader::get();
     if (loose_file_loader == nullptr || !loose_file_loader->can_loosely_load_file(path_check_against_loose_file.c_str())) {
-        return;
+        return original(path, size, combine);
     }
 
     // Get or increment the counter for this path
@@ -788,7 +839,7 @@ void LooseTextureLoader::handle_resource_hash_path(safetyhook::Context& context)
     }
 
     if (!m_disable_texture_cache->value()) {
-        return; // Still count, but don't modify the hash path
+        return original(path, size, combine); // Still count, but don't modify the hash path
     }
 
     // Build the modified path in a thread-local buffer to avoid allocations visible to other threads
@@ -796,6 +847,5 @@ void LooseTextureLoader::handle_resource_hash_path(safetyhook::Context& context)
     tls_modified_path.assign(path_view.data(), path_view.size());
     tls_modified_path += std::to_wstring(counter);
 
-    context.rcx = reinterpret_cast<uintptr_t>(tls_modified_path.c_str());
-    context.rdx = tls_modified_path.size() * sizeof(wchar_t);
+    return original(tls_modified_path.c_str(), tls_modified_path.size() * sizeof(wchar_t), combine);
 }
