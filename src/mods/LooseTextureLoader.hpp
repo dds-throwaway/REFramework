@@ -118,9 +118,22 @@ private:
     ModToggle::Ptr m_enabled{ ModToggle::create(generate_name("Enabled"), true) };
     ModToggle::Ptr m_disable_texture_cache{ ModToggle::create(generate_name("DisableTextureCache"), false) };
 
+    // Per-step switches for early_initialize(). Three of its four steps patch game code (the wcsstr
+    // call sites, the enqueue chain, the resource-path hash call); the game's anti-tamper reacts to
+    // at least one of them and the process is poisoned. These exist to find which one. Defaults
+    // preserve the previous behaviour exactly.
+    ModToggle::Ptr m_hook_path_checks{ ModToggle::create(generate_name("HookDStoragePathChecks"), true) };
+    ModToggle::Ptr m_hook_enqueue_chain{ ModToggle::create(generate_name("HookDStorageEnqueueChain"), true) };
+    ModToggle::Ptr m_hook_resource_path_hashing{ ModToggle::create(generate_name("HookResourcePathHashing"), true) };
+    ModToggle::Ptr m_find_get_path_to_resource{ ModToggle::create(generate_name("FindGetPathToResource"), true) };
+
     std::vector<std::reference_wrapper<IModValue>> m_options{
         *m_enabled,
         *m_disable_texture_cache,
+        *m_hook_path_checks,
+        *m_hook_enqueue_chain,
+        *m_hook_resource_path_hashing,
+        *m_find_get_path_to_resource,
     };
 
     // Lazy-cached values

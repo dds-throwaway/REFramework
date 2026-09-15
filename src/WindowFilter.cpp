@@ -17,6 +17,7 @@ WindowFilter::WindowFilter() {
     // We create a job thread because GetWindowTextA can actually deadlock inside
     // the present thread...
     m_job_thread = std::make_unique<std::jthread>([this](std::stop_token s){
+        spdlog::info("[Thread] window_filter_job_thread TID {}", GetCurrentThreadId());
         while (!s.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::milliseconds{100});
 
