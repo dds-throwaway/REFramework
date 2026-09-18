@@ -287,6 +287,10 @@ void IntegrityCheckBypass::on_frame() {
             for (const auto& family : s_seen_pak_families) {
                 spdlog::error("[IntegrityCheckBypass]:   {}", utility::narrow(family));
             }
+
+            spdlog::error("[IntegrityCheckBypass]:   pak template captured: {}; auto-assigned: {}. "
+                "(template false means no pak mount was ever seen by the hook - see the crash-findings doc, §19.)",
+                s_pristine_pak_captured, s_auto_assigned);
         }
     }
 
@@ -746,13 +750,28 @@ bool IntegrityCheckBypass::pak_load_check_function(void* pak_struct, const wchar
 
     std::filesystem::path pak_path{pak_name_wstr};
 
-    if (pak_path.filename() == L"re_chunk_000.pak") {
+    // Capture the template from the first mount this hook ever sees, whichever family it is.
+    // Requiring re_chunk_000.pak was the bug: the game can mount the base pak before this hook is
+    // installed, in which case the template is never captured and every injection is built from an
+    // all-zero struct and rejected by the engine - the intermittent 'NONE were injected' failure.
+    // pak_struct is pre-load here (the original runs at the end of this function), which is what makes
+    // it usable as a pristine template.
+    if (!s_pristine_pak_captured && pak_struct != nullptr) {
+        const auto template_vtable = *reinterpret_cast<uintptr_t*>(pak_struct);
+
         memcpy(s_pristine_pak_struct.data(), pak_struct, s_pristine_pak_struct.size());
+        s_pristine_pak_captured = true;
+
+        spdlog::info("[IntegrityCheckBypass]: Captured the pak template from '{}' (vtable 0x{:X}{}).",
+            utility::narrow(pak_path.wstring()), template_vtable,
+            utility::get_module_within(template_vtable).has_value() ? "" : ", WARNING: not a module pointer");
 
         //spdlog::info("[IntegrityCheckBypass]: Found pak_ctor at 0x{:X}", (uintptr_t)pak_ctor);
 
         // First find where pak_struct is pointed to on the stack next to a bunch of nullptrs.
         // This means that's the start of the pak array.
+        // Only meaningful for the base pak's own mount (the array begins at its slot); nothing reads
+        // s_pak_array_start/s_pak_array_len today, so recording it for another family would be inert.
         auto stack = reinterpret_cast<uintptr_t*>(_AddressOfReturnAddress()); // Approximation of stack start
 
         for (int i = 0; i < 0x5000; ++i) {
@@ -877,6 +896,15 @@ void* IntegrityCheckBypass::pak_load_patch_load_function(uintptr_t* pak_slots, c
     }
 
     s_seen_pak_families.emplace(base_path);
+
+    if (!s_pristine_pak_captured) {
+        // Injecting now would build the fake pak from an all-zero template and the engine would reject
+        // it. Skip instead, so the family stays eligible for a retry on a later mount rather than
+        // burning the auto-assign slot on garbage.
+        spdlog::warn("[IntegrityCheckBypass]: no pak template captured yet, skipping injection for '{}' - "
+            "the hook has not seen any pak mount.", utility::narrow(base_path));
+        return res;
+    }
 
     bool did_auto_assign = false;
 

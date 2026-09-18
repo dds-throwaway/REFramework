@@ -142,6 +142,8 @@ private:
     };
 
     static inline std::vector<PakRebase> s_pak_rebase_offsets{};
+    // Set once the pristine template has been captured from the first pak mount the hook sees.
+    static inline bool s_pristine_pak_captured{false};
     static inline uintptr_t* s_pak_array_start{nullptr};
     static inline size_t s_pak_array_len{0};
     static inline size_t s_event_handle_offset{0};
