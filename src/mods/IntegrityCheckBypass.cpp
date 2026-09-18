@@ -721,6 +721,30 @@ std::optional<uint16_t> get_pak_flags(const std::filesystem::path& path) try {
 
 #pragma region PAK_LOADING
 
+// Takes the pristine template from this mount when it beats what is already held: the first mount seen
+// supplies it, so a base pak that mounted before this hook existed does not disable injection outright, and
+// a later re_chunk_000.pak supersedes a template taken from another family (that being the source the
+// original code used). pak_struct is pre-load here - the original runs at the end of the caller.
+//
+// There is deliberately no validity test on the struct: every pak mount observed so far reports a null
+// first field, the base pak included, and the engine accepted a fake pak built from such a template.
+// Returns the struct's first field, which the caller logs.
+std::optional<uintptr_t> IntegrityCheckBypass::capture_pak_template(void* pak_struct, bool is_base_pak) {
+    if (pak_struct == nullptr) {
+        return std::nullopt;
+    }
+
+    if (s_pristine_pak_captured && (!is_base_pak || s_pristine_pak_from_base)) {
+        return std::nullopt; // already holding a template the base pak cannot improve on
+    }
+
+    memcpy(s_pristine_pak_struct.data(), pak_struct, s_pristine_pak_struct.size());
+    s_pristine_pak_captured = true;
+    s_pristine_pak_from_base = is_base_pak;
+
+    return *reinterpret_cast<uintptr_t*>(pak_struct);
+}
+
 bool IntegrityCheckBypass::pak_load_check_function(void* pak_struct, const wchar_t* pak_name_wstr, uintptr_t a3, uintptr_t is_mount, uintptr_t a5, uintptr_t a6, uintptr_t a7) {
     const auto return_address = (uintptr_t)_ReturnAddress();
 
@@ -749,22 +773,12 @@ bool IntegrityCheckBypass::pak_load_check_function(void* pak_struct, const wchar
     }
 
     std::filesystem::path pak_path{pak_name_wstr};
+    const bool is_base_pak = pak_path.filename() == L"re_chunk_000.pak";
 
-    // Capture the template from the first mount this hook ever sees, whichever family it is.
-    // Requiring re_chunk_000.pak was the bug: the game can mount the base pak before this hook is
-    // installed, in which case the template is never captured and every injection is built from an
-    // all-zero struct and rejected by the engine - the intermittent 'NONE were injected' failure.
-    // pak_struct is pre-load here (the original runs at the end of this function), which is what makes
-    // it usable as a pristine template.
-    if (!s_pristine_pak_captured && pak_struct != nullptr) {
-        const auto template_vtable = *reinterpret_cast<uintptr_t*>(pak_struct);
-
-        memcpy(s_pristine_pak_struct.data(), pak_struct, s_pristine_pak_struct.size());
-        s_pristine_pak_captured = true;
-
-        spdlog::info("[IntegrityCheckBypass]: Captured the pak template from '{}' (vtable 0x{:X}{}).",
-            utility::narrow(pak_path.wstring()), template_vtable,
-            utility::get_module_within(template_vtable).has_value() ? "" : ", WARNING: not a module pointer");
+    if (const auto template_first_field = capture_pak_template(pak_struct, is_base_pak)) {
+        spdlog::info("[IntegrityCheckBypass]: Captured the pak template from '{}' (first field 0x{:X}{}).",
+            utility::narrow(pak_path.wstring()), *template_first_field,
+            is_base_pak ? "" : ", waiting for re_chunk_000.pak to refine it");
 
         //spdlog::info("[IntegrityCheckBypass]: Found pak_ctor at 0x{:X}", (uintptr_t)pak_ctor);
 
