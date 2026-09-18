@@ -76,6 +76,7 @@ private:
     sdk::ResourceManager* get_resource_manager();
     void* get_resource_re_type(ResourceType type);
 
+    void load_early_switches();
     void hook_dstorage_path_checks();
     void hook_dstorage_enqueue_chain();
     void hook_resource_path_hashing();
@@ -126,9 +127,21 @@ private:
     ModToggle::Ptr m_enabled{ ModToggle::create(generate_name("Enabled"), true) };
     ModToggle::Ptr m_disable_texture_cache{ ModToggle::create(generate_name("DisableTextureCache"), false) };
 
+    // Debug: gate each of the four early steps individually, so a bisect costs a config edit instead of a
+    // rebuild. These are read before on_config_load runs (see load_early_switches) because
+    // early_initialize() runs first. Defaults keep the previous behaviour.
+    ModToggle::Ptr m_hook_path_checks{ ModToggle::create(generate_name("HookDStoragePathChecks"), true) };
+    ModToggle::Ptr m_hook_enqueue_chain{ ModToggle::create(generate_name("HookDStorageEnqueueChain"), true) };
+    ModToggle::Ptr m_hook_resource_hashing{ ModToggle::create(generate_name("HookResourcePathHashing"), true) };
+    ModToggle::Ptr m_find_get_path_to_resource{ ModToggle::create(generate_name("FindGetPathToResource"), true) };
+
     std::vector<std::reference_wrapper<IModValue>> m_options{
         *m_enabled,
         *m_disable_texture_cache,
+        *m_hook_path_checks,
+        *m_hook_enqueue_chain,
+        *m_hook_resource_hashing,
+        *m_find_get_path_to_resource,
     };
 
     // Lazy-cached values

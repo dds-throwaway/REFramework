@@ -1,5 +1,6 @@
 ﻿#include <algorithm>
 #include <array>
+#include <filesystem>
 #include <intrin.h>
 #include <optional>
 #include <utility>
@@ -16,6 +17,7 @@
 #include "LooseFileLoader.hpp"
 #include "LooseTextureLoader.hpp"
 #include "REFramework.hpp"
+#include "mods/REFrameworkConfig.hpp"
 
 LooseTextureLoader& LooseTextureLoader::get() {
     return LooseFileLoader::get()->get_texture_loader();
@@ -135,16 +137,54 @@ static std::optional<uintptr_t> resolve_import_slot(uintptr_t call_addr) {
     return std::nullopt;
 }
 
+// REFramework loads mod configs after early_initialize() has already run, so switches meant to gate the
+// early hooks would otherwise have no effect on them. Read the config here instead.
+void LooseTextureLoader::load_early_switches() {
+    const auto config_path = REFramework::get_persistent_dir(REFrameworkConfig::REFRAMEWORK_CONFIG_NAME.data()).string();
+
+    if (!std::filesystem::exists(utility::widen(config_path))) {
+        spdlog::info("[LooseTextureLoader]: no config at {} yet, early switches are at their defaults", config_path);
+        return;
+    }
+
+    const utility::Config cfg{config_path};
+    on_config_load(cfg);
+}
+
 void LooseTextureLoader::early_initialize() {
 #if ENABLE_LOOSE_TEXTURE_LOADER
     // Only TDB>=81 games (MHWILDS+) have the DStorage-based loose texture path.
     if (sdk::GameIdentity::get().tdb_ver() < 81) {
         return;
     }
-    hook_dstorage_path_checks();
-    hook_dstorage_enqueue_chain();
-    hook_resource_path_hashing();
-    find_get_path_to_resource_func();
+
+    load_early_switches();
+
+    spdlog::info("[LooseTextureLoader]: early switches: Enabled={} HookDStoragePathChecks={} HookDStorageEnqueueChain={} "
+        "HookResourcePathHashing={} FindGetPathToResource={}",
+        m_enabled->value(), m_hook_path_checks->value(), m_hook_enqueue_chain->value(),
+        m_hook_resource_hashing->value(), m_find_get_path_to_resource->value());
+
+    if (!m_enabled->value()) {
+        spdlog::info("[LooseTextureLoader]: disabled, not installing any early hooks");
+        return;
+    }
+
+    if (m_hook_path_checks->value()) {
+        hook_dstorage_path_checks();
+    }
+
+    if (m_hook_enqueue_chain->value()) {
+        hook_dstorage_enqueue_chain();
+    }
+
+    if (m_hook_resource_hashing->value()) {
+        hook_resource_path_hashing();
+    }
+
+    if (m_find_get_path_to_resource->value()) {
+        find_get_path_to_resource_func();
+    }
 #endif
 }
 
