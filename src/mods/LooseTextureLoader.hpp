@@ -65,6 +65,8 @@ private:
 
     static constexpr const wchar_t *DEFAULT_ROOT_RESOURCE_PATH = L"natives/STM/";
     static constexpr const wchar_t *TEX_FILE_EXTENSION = L".tex.";
+    // The substr the base-pak path check searches for.
+    static constexpr const wchar_t *PAK_PATTERN = L".sub_000.pak";
 
     static constexpr size_t MAX_RECENT_DISPLAY = 50;
 
@@ -79,7 +81,6 @@ private:
     void find_get_path_to_resource_func();
 
     std::optional<uintptr_t> find_direct_storage_file_open_function();
-    void handle_path_check_to_open_dstorage_file(safetyhook::Context& context);
     void handle_prepare_enqueue_texture_upload(safetyhook::Context& context);
     void handle_start_enqueue_texture_upload(safetyhook::Context& context);
     REPakEntryData* borrow_pak_entry_data(uintptr_t dstorage_file_ptr);
@@ -87,14 +88,17 @@ private:
     void handle_resource_hash_path(safetyhook::Context& context);
 
     // Static wrappers for safetyhook callbacks (must be plain function pointers)
-    static void handle_path_check_to_open_dstorage_file_wrapper(safetyhook::Context& context);
+    // Occupies the wcsstr import slot; only the base-pak path check is overridden.
+    static const wchar_t* __cdecl wcsstr_hook(const wchar_t* str, const wchar_t* substr);
     static void handle_prepare_enqueue_texture_upload_wrapper(safetyhook::Context& context);
     static void handle_start_enqueue_texture_upload_wrapper(safetyhook::Context& context);
     static void handle_resource_hash_path_wrapper(safetyhook::Context& context);
 
 private:
     // Hooks
-    std::vector<safetyhook::MidHook> m_path_check_dstorage_hooks{};
+    // The wcsstr import slot, and the implementation we displaced.
+    static inline void** s_wcsstr_slot{};
+    static inline const wchar_t* (__cdecl* s_wcsstr_original)(const wchar_t*, const wchar_t*){};
     safetyhook::MidHook m_prepare_enqueue_texture_upload_hook{};
     safetyhook::MidHook m_start_enqueue_texture_upload_hook{};
     safetyhook::MidHook m_resource_hash_path_hook{};

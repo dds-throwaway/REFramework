@@ -27,10 +27,6 @@ void LooseTextureLoader::handle_start_enqueue_texture_upload_wrapper(safetyhook:
     get().handle_start_enqueue_texture_upload(context);
 }
 
-void LooseTextureLoader::handle_path_check_to_open_dstorage_file_wrapper(safetyhook::Context& context) {
-    get().handle_path_check_to_open_dstorage_file(context);
-}
-
 void LooseTextureLoader::handle_resource_hash_path_wrapper(safetyhook::Context& context) {
     get().handle_resource_hash_path(context);
 }
@@ -148,6 +144,26 @@ void* LooseTextureLoader::get_resource_re_type(ResourceType type) {
     return m_resource_re_type_cache[type];
 }
 
+static std::optional<uintptr_t> resolve_import_slot(uintptr_t call_addr) {
+    const auto opcode = *reinterpret_cast<const uint8_t*>(call_addr);
+
+    if (opcode == 0xFF && *reinterpret_cast<const uint8_t*>(call_addr + 1) == 0x15) {
+        return call_addr + 6 + *reinterpret_cast<const int32_t*>(call_addr + 2);
+    }
+
+    if (opcode == 0xE8) {
+        const auto target = call_addr + 5 + *reinterpret_cast<const int32_t*>(call_addr + 1);
+
+        if (*reinterpret_cast<const uint8_t*>(target) == 0xFF
+            && *reinterpret_cast<const uint8_t*>(target + 1) == 0x25) {
+            return target + 6 + *reinterpret_cast<const int32_t*>(target + 2);
+        }
+    }
+
+    return std::nullopt;
+}
+
+
 void LooseTextureLoader::hook_dstorage_path_checks() {
     auto game = utility::get_executable();
     auto sub_pak_str = utility::scan_string(game, L".sub_000.pak");
@@ -163,7 +179,8 @@ void LooseTextureLoader::hook_dstorage_path_checks() {
         return;
     }
 
-    // For each reference, scan until hitting a call instruction (wcsstr)
+    // Replace only the imported wcsstr's IAT slot
+    std::optional<uintptr_t> slot_addr{};
     for (auto ref : fnc_refs) {
         uintptr_t wcsstr_call_addr = 0;
 
@@ -179,14 +196,39 @@ void LooseTextureLoader::hook_dstorage_path_checks() {
             continue;
         }
 
-        auto hook = safetyhook::create_mid((void*)wcsstr_call_addr, &LooseTextureLoader::handle_path_check_to_open_dstorage_file_wrapper);
-        if (hook) {
-            spdlog::info("[LooseTextureLoader]: Hooked wcsstr call at 0x{:X} for DStorage .tex bypass", wcsstr_call_addr);
-        } else {
-            spdlog::error("[LooseTextureLoader]: Failed to hook wcsstr call at 0x{:X}!", wcsstr_call_addr);
+        slot_addr = resolve_import_slot(wcsstr_call_addr);
+
+        if (slot_addr) {
+            spdlog::info("[LooseTextureLoader]: wcsstr call at 0x{:X} goes through IAT slot 0x{:X}", wcsstr_call_addr, *slot_addr);
+            break;
         }
-        m_path_check_dstorage_hooks.push_back(std::move(hook));
     }
+
+    if (!slot_addr) {
+        spdlog::error("[LooseTextureLoader]: Could not resolve the wcsstr IAT slot");
+        return;
+    }
+
+    if (s_wcsstr_slot != nullptr) {
+        return;
+    }
+
+    auto* const slot = reinterpret_cast<void**>(*slot_addr);
+    DWORD old_protect{};
+
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old_protect)) {
+        spdlog::error("[LooseTextureLoader]: Could not make the wcsstr IAT slot at 0x{:X} writable", *slot_addr);
+        return;
+    }
+
+    s_wcsstr_original = reinterpret_cast<decltype(s_wcsstr_original)>(*slot);
+    s_wcsstr_slot = slot;
+    *slot = reinterpret_cast<void*>(&LooseTextureLoader::wcsstr_hook);
+
+    VirtualProtect(slot, sizeof(void*), old_protect, &old_protect);
+
+    spdlog::info("[LooseTextureLoader]: Replaced wcsstr IAT slot 0x{:X} (was 0x{:X})",
+        *slot_addr, reinterpret_cast<uintptr_t>(s_wcsstr_original));
 }
 
 void LooseTextureLoader::hook_dstorage_enqueue_chain() {
@@ -599,17 +641,18 @@ std::optional<uintptr_t> LooseTextureLoader::find_direct_storage_file_open_funct
     return func_start;
 }
 
-void LooseTextureLoader::handle_path_check_to_open_dstorage_file(safetyhook::Context& context) {
-    if (!m_enabled->value()) return;
-
-    wchar_t *target_path = (wchar_t*)context.rcx;
-    wchar_t *search_str = (wchar_t*)context.rdx;
-    
-    // Search if our path contains .tex extension, if yes, replace rdx with ".tex" to make wcsstr return true
-    if (target_path && search_str && wcsstr(target_path, TEX_FILE_EXTENSION) != nullptr) {
-        //spdlog::info("[LooseTextureLoader]: Detected loose .tex file, patching to bypass it! Path: {}", utility::narrow(target_path));
-        context.rdx = (uint64_t)TEX_FILE_EXTENSION;
+const wchar_t* __cdecl LooseTextureLoader::wcsstr_hook(const wchar_t* str, const wchar_t* substr) {
+    if (!get().m_enabled->value()) {
+        return s_wcsstr_original(str, substr);
     }
+
+    // A loose .tex is not in the base pak, so answer as if the path contained ".tex" so it loads.
+    if (substr != nullptr && wcscmp(substr, PAK_PATTERN) == 0
+        && str != nullptr && s_wcsstr_original(str, TEX_FILE_EXTENSION) != nullptr) {
+        return s_wcsstr_original(str, TEX_FILE_EXTENSION);
+    }
+
+    return s_wcsstr_original(str, substr);
 }
 
 REPakEntryData* LooseTextureLoader::borrow_pak_entry_data(uintptr_t dstorage_file_ptr) {
