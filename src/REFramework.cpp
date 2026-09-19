@@ -34,6 +34,7 @@ extern "C" {
 #include "utility/PersistentTreeState.hpp"
 #include "utility/Scan.hpp"
 #include "utility/Thread.hpp"
+#include "utility/WorldFreezeLog.hpp"
 
 #include "Mods.hpp"
 #include "mods/FaultyFileDetector.hpp"
@@ -596,6 +597,8 @@ REFramework::REFramework(HMODULE reframework_module)
 
 
     if (gi.is_reengine_at()) {
+        // The dependency logs per thread from inside this window; see WorldFreezeLog.
+        WorldFreezeLog freeze_log;
         utility::ThreadSuspender suspender{};
         IntegrityCheckBypass::ignore_application_entries();
 
