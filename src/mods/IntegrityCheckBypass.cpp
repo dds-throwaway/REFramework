@@ -287,6 +287,10 @@ void IntegrityCheckBypass::on_frame() {
             for (const auto& family : s_seen_pak_families) {
                 spdlog::error("[IntegrityCheckBypass]:   {}", utility::narrow(family));
             }
+
+            spdlog::error("[IntegrityCheckBypass]:   pak template captured: {}; auto-assigned: {}. "
+                "(template false means no pak mount was ever seen by the hook.)",
+                s_pristine_pak_captured, s_auto_assigned);
         }
     }
 
@@ -717,6 +721,30 @@ std::optional<uint16_t> get_pak_flags(const std::filesystem::path& path) try {
 
 #pragma region PAK_LOADING
 
+// Takes the pristine template from this mount when it beats what is already held: the first mount seen
+// supplies it, so a base pak that mounted before this hook existed does not disable injection outright, and
+// a later re_chunk_000.pak supersedes a template taken from another family (that being the source the
+// original code used). pak_struct is pre-load here - the original runs at the end of the caller.
+//
+// There is deliberately no validity test on the struct: every pak mount observed so far reports a null
+// first field, the base pak included, and the engine accepted a fake pak built from such a template.
+// Returns the struct's first field, which the caller logs.
+std::optional<uintptr_t> IntegrityCheckBypass::capture_pak_template(void* pak_struct, bool is_base_pak) {
+    if (pak_struct == nullptr) {
+        return std::nullopt;
+    }
+
+    if (s_pristine_pak_captured && (!is_base_pak || s_pristine_pak_from_base)) {
+        return std::nullopt; // already holding a template the base pak cannot improve on
+    }
+
+    memcpy(s_pristine_pak_struct.data(), pak_struct, s_pristine_pak_struct.size());
+    s_pristine_pak_captured = true;
+    s_pristine_pak_from_base = is_base_pak;
+
+    return *reinterpret_cast<uintptr_t*>(pak_struct);
+}
+
 bool IntegrityCheckBypass::pak_load_check_function(void* pak_struct, const wchar_t* pak_name_wstr, uintptr_t a3, uintptr_t is_mount, uintptr_t a5, uintptr_t a6, uintptr_t a7) {
     const auto return_address = (uintptr_t)_ReturnAddress();
 
@@ -745,14 +773,19 @@ bool IntegrityCheckBypass::pak_load_check_function(void* pak_struct, const wchar
     }
 
     std::filesystem::path pak_path{pak_name_wstr};
+    const bool is_base_pak = pak_path.filename() == L"re_chunk_000.pak";
 
-    if (pak_path.filename() == L"re_chunk_000.pak") {
-        memcpy(s_pristine_pak_struct.data(), pak_struct, s_pristine_pak_struct.size());
+    if (const auto template_first_field = capture_pak_template(pak_struct, is_base_pak)) {
+        spdlog::info("[IntegrityCheckBypass]: Captured the pak template from '{}' (first field 0x{:X}{}).",
+            utility::narrow(pak_path.wstring()), *template_first_field,
+            is_base_pak ? "" : ", waiting for re_chunk_000.pak to refine it");
 
         //spdlog::info("[IntegrityCheckBypass]: Found pak_ctor at 0x{:X}", (uintptr_t)pak_ctor);
 
         // First find where pak_struct is pointed to on the stack next to a bunch of nullptrs.
         // This means that's the start of the pak array.
+        // Only meaningful for the base pak's own mount (the array begins at its slot); nothing reads
+        // s_pak_array_start/s_pak_array_len today, so recording it for another family would be inert.
         auto stack = reinterpret_cast<uintptr_t*>(_AddressOfReturnAddress()); // Approximation of stack start
 
         for (int i = 0; i < 0x5000; ++i) {
@@ -877,6 +910,15 @@ void* IntegrityCheckBypass::pak_load_patch_load_function(uintptr_t* pak_slots, c
     }
 
     s_seen_pak_families.emplace(base_path);
+
+    if (!s_pristine_pak_captured) {
+        // Injecting now would build the fake pak from an all-zero template and the engine would reject
+        // it. Skip instead, so the family stays eligible for a retry on a later mount rather than
+        // burning the auto-assign slot on garbage.
+        spdlog::warn("[IntegrityCheckBypass]: no pak template captured yet, skipping injection for '{}' - "
+            "the hook has not seen any pak mount.", utility::narrow(base_path));
+        return res;
+    }
 
     bool did_auto_assign = false;
 
