@@ -136,12 +136,20 @@ private:
     constexpr static size_t PRISTINE_PAK_STRUCT_SIZE = 0x300;
     static inline std::array<uint8_t, PRISTINE_PAK_STRUCT_SIZE> s_pristine_pak_struct{};
 
+    // Takes the template from this mount when it beats what is already held, re-taking it from
+    // re_chunk_000.pak if that mounts later. Returns the struct's first field for logging, or nullopt when
+    // this mount is not a candidate; the definition explains why there is no validity test on the struct.
+    static std::optional<uintptr_t> capture_pak_template(void* pak_struct, bool is_base_pak);
+
     struct PakRebase {
         size_t offset;
         size_t delta_from_base;
     };
 
     static inline std::vector<PakRebase> s_pak_rebase_offsets{};
+    // Set by capture_pak_template(): whether a usable template exists, and whether it came from the base pak.
+    static inline bool s_pristine_pak_captured{false};
+    static inline bool s_pristine_pak_from_base{false};
     static inline uintptr_t* s_pak_array_start{nullptr};
     static inline size_t s_pak_array_len{0};
     static inline size_t s_event_handle_offset{0};

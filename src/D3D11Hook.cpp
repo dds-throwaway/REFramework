@@ -2,6 +2,7 @@
 #include <spdlog/spdlog.h>
 #include <utility/Thread.hpp>
 #include <utility/Module.hpp>
+#include <utility/WorldFreezeLog.hpp>
 
 #include <openvr.h>
 
@@ -77,6 +78,8 @@ bool D3D11Hook::hook() {
         }
     }
 
+    // The dependency logs per thread from inside this window; see WorldFreezeLog.
+    WorldFreezeLog freeze_log;
     utility::ThreadSuspender suspender{};
 
     try {

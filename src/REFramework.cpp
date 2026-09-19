@@ -34,6 +34,7 @@ extern "C" {
 #include "utility/PersistentTreeState.hpp"
 #include "utility/Scan.hpp"
 #include "utility/Thread.hpp"
+#include "utility/WorldFreezeLog.hpp"
 
 #include "Mods.hpp"
 #include "mods/FaultyFileDetector.hpp"
@@ -54,6 +55,78 @@ extern "C" {
 #include "REFramework.hpp"
 
 namespace fs = std::filesystem;
+
+// Debug aid for the intermittent startup deaths: log every first-chance exception with its registers and a
+// stack window, so a force-terminated process still leaves evidence. RIP 0 is always logged (that is the
+// shape of the integrity poison); other addresses are logged once each.
+static LONG NTAPI first_chance_exception_logger(PEXCEPTION_POINTERS info) {
+    const auto* rec = info != nullptr ? info->ExceptionRecord : nullptr;
+    const auto* ctx = info != nullptr ? info->ContextRecord : nullptr;
+
+    if (rec == nullptr || ctx == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    static uintptr_t seen_rips[128]{};
+    const auto rip = static_cast<uintptr_t>(ctx->Rip);
+
+    if (rip != 0) {
+        for (const auto known : seen_rips) {
+            if (known == rip) {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+        }
+
+        for (auto& slot : seen_rips) {
+            if (slot == 0) {
+                slot = rip;
+                break;
+            }
+        }
+    }
+
+    spdlog::info("[VEH] code={:X} addr={:X} RIP={:X} RSP={:X} RBP={:X} RAX={:X} RBX={:X} RCX={:X} RDX={:X} RSI={:X} RDI={:X} "
+        "R8={:X} R9={:X} R10={:X} R11={:X} R12={:X} R13={:X} R14={:X} R15={:X} EFLAGS={:X}",
+        rec->ExceptionCode, reinterpret_cast<uintptr_t>(rec->ExceptionAddress), rip, ctx->Rsp, ctx->Rbp,
+        ctx->Rax, ctx->Rbx, ctx->Rcx, ctx->Rdx, ctx->Rsi, ctx->Rdi, ctx->R8, ctx->R9, ctx->R10, ctx->R11,
+        ctx->R12, ctx->R13, ctx->R14, ctx->R15, ctx->EFlags);
+
+    if (ctx->Rsp != 0 && !IsBadReadPtr(reinterpret_cast<const void*>(ctx->Rsp), sizeof(uintptr_t) * 8)) {
+        const auto* stack = reinterpret_cast<const uintptr_t*>(ctx->Rsp);
+
+        spdlog::info("[VEH]   stack[0..7] {:016X} {:016X} {:016X} {:016X} {:016X} {:016X} {:016X} {:016X}",
+            stack[0], stack[1], stack[2], stack[3], stack[4], stack[5], stack[6], stack[7]);
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+using RtlAddVectoredExceptionHandler_t = PVOID (NTAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+
+static void install_first_chance_exception_logger() {
+    char value[8]{};
+
+    if (GetEnvironmentVariableA("REF_DISABLE_EARLY_DIAGNOSTICS", value, sizeof(value)) != 0) {
+        spdlog::info("[REFramework] first-chance exception logger disabled by environment");
+        return;
+    }
+
+    // Resolved from ntdll rather than called directly: the SDK does not always declare this one, and the
+    // Rtl entry point avoids IntegrityCheckBypass's AddVectoredExceptionHandler hook, which filters
+    // callers and records that it was called.
+    const auto ntdll = GetModuleHandleA("ntdll.dll");
+    const auto rtl_add_vectored_exception_handler = ntdll != nullptr
+        ? reinterpret_cast<RtlAddVectoredExceptionHandler_t>(GetProcAddress(ntdll, "RtlAddVectoredExceptionHandler"))
+        : nullptr;
+
+    if (rtl_add_vectored_exception_handler != nullptr
+        && rtl_add_vectored_exception_handler(1, first_chance_exception_logger) != nullptr) {
+        spdlog::info("[REFramework] first-chance exception logger installed");
+    } else {
+        spdlog::error("[REFramework] failed to install the first-chance exception logger");
+    }
+}
+
 using namespace std::literals;
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -487,6 +560,7 @@ REFramework::REFramework(HMODULE reframework_module)
         }
     }
 
+    install_first_chance_exception_logger();
     LooseTextureLoader::get().early_initialize();
 
     if (gi.tdb_ver() >= 81) {
@@ -523,6 +597,8 @@ REFramework::REFramework(HMODULE reframework_module)
 
 
     if (gi.is_reengine_at()) {
+        // The dependency logs per thread from inside this window; see WorldFreezeLog.
+        WorldFreezeLog freeze_log;
         utility::ThreadSuspender suspender{};
         IntegrityCheckBypass::ignore_application_entries();
 

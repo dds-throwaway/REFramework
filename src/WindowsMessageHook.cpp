@@ -4,6 +4,7 @@
 #include <spdlog/spdlog.h>
 
 #include "utility/Thread.hpp"
+#include "utility/WorldFreezeLog.hpp"
 
 #include "WindowsMessageHook.hpp"
 
@@ -40,6 +41,8 @@ WindowsMessageHook::WindowsMessageHook(HWND wnd)
     std::lock_guard _{ g_proc_mutex };
     spdlog::info("Initializing WindowsMessageHook");
 
+    // The dependency logs per thread from inside this window; see WorldFreezeLog.
+    WorldFreezeLog freeze_log;
     utility::ThreadSuspender suspender{};
 
     g_windows_message_hook = this;
@@ -57,6 +60,8 @@ WindowsMessageHook::~WindowsMessageHook() {
     std::lock_guard _{ g_proc_mutex };
     spdlog::info("Destroying WindowsMessageHook");
 
+    // The dependency logs per thread from inside this window; see WorldFreezeLog.
+    WorldFreezeLog freeze_log;
     utility::ThreadSuspender suspender{};
 
     remove();
